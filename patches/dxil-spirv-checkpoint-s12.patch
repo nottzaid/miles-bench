@@ -1,0 +1,47 @@
+diff --git a/descriptor_qa.cpp b/descriptor_qa.cpp
+index 21054b55..f5589f10 100644
+--- a/descriptor_qa.cpp
++++ b/descriptor_qa.cpp
+@@ -406,6 +406,26 @@ spv::Id build_descriptor_qa_check_function(SPIRVModule &module)
+ 	                                   cookie_shifted_id, cookie_mask_id,
+ 	                                   descriptor_timestamp_id, descriptor_info_id);
+ 
++	// miles-bench: count accesses per resource. live_status_table[DESCRIPTOR_QA_COUNT_BASE + (cookie & mask)]
++	// is a per-cookie access counter (vkd3d sizes the table to match, see vkd3d_descriptor_debug.h).
++	{
++		spv::Id u32_type = builder.makeUintType(32);
++		spv::Id slot_id = build_binary_op(builder, u32_type, spv::OpBitwiseAnd, cookie_id,
++		                                  builder.makeUintConstant(DESCRIPTOR_QA_COUNT_SLOTS - 1));
++		spv::Id index_id = build_binary_op(builder, u32_type, spv::OpIAdd, slot_id,
++		                                   builder.makeUintConstant(DESCRIPTOR_QA_COUNT_BASE));
++		spv::Id ptr_type = builder.makePointer(spv::StorageClassStorageBuffer, u32_type);
++		auto *chain = builder.addInstruction(ptr_type, spv::OpAccessChain);
++		chain->addIdOperand(global_buffer_id);
++		chain->addIdOperand(builder.makeUintConstant(uint32_t(DescriptorQAGlobalMembers::LiveStatusTable)));
++		chain->addIdOperand(index_id);
++		auto *add = builder.addInstruction(u32_type, spv::OpAtomicIAdd);
++		add->addIdOperand(chain->getResultId());
++		add->addIdOperand(builder.getAtomicDeviceScopeId());
++		add->addIdOperand(builder.makeUintConstant(0));
++		add->addIdOperand(builder.makeUintConstant(1));
++	}
++
+ 	spv::Id live_status_id = build_ssbo_load_array(builder, builder.makeUintType(32),
+ 	                                               global_buffer_id,
+ 	                                               uint32_t(DescriptorQAGlobalMembers::LiveStatusTable),
+diff --git a/descriptor_qa.hpp b/descriptor_qa.hpp
+index dda7ba02..471228c4 100644
+--- a/descriptor_qa.hpp
++++ b/descriptor_qa.hpp
+@@ -31,6 +31,11 @@ namespace dxil_spv
+ {
+ static constexpr uint32_t Version = 2;
+ 
++// miles-bench access counting: per-cookie counters after the live status bits for
++// VKD3D_DESCRIPTOR_DEBUG_DEFAULT_NUM_COOKIES (1 << 24) cookies, i.e. at word 1 << 19.
++static constexpr uint32_t DESCRIPTOR_QA_COUNT_BASE = 1u << 19;
++static constexpr uint32_t DESCRIPTOR_QA_COUNT_SLOTS = 1u << 20;
++
+ struct DescriptorQAInfo
+ {
+ 	uint32_t version = 0;

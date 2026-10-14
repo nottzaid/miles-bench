@@ -1,0 +1,12 @@
+src/
+build/
+captures/
+ghidra/
+*.log
+prefix/
+tools/dl-ghidra/
+tools/dl-ghidramcp/
+tools/ghidra_12.1.4_PUBLIC/
+tools/ghidra-proj/
+vkd3d-proton.cache
+__pycache__/

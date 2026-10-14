@@ -1,0 +1,499 @@
+diff --git a/libs/vkd3d/heap.c b/libs/vkd3d/heap.c
+index 74c75ecb..a51dae4b 100644
+--- a/libs/vkd3d/heap.c
++++ b/libs/vkd3d/heap.c
+@@ -76,6 +76,7 @@ static ULONG STDMETHODCALLTYPE d3d12_heap_AddRef(d3d12_heap_iface *iface)
+ static void d3d12_heap_destroy(struct d3d12_heap *heap)
+ {
+     TRACE("Destroying heap %p.\n", heap);
++    vkd3d_memtrace_heap_destroy(heap);
+ 
+     d3d_destruction_notifier_free(&heap->destruction_notifier);
+ 
+@@ -416,6 +417,7 @@ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *de
+     }
+ 
+     TRACE("Created heap %p.\n", object);
++    vkd3d_memtrace_heap_create(device, object);
+ 
+     *heap = object;
+     return S_OK;
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index 712b0b75..1a8ef356 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -778,7 +778,7 @@ static HRESULT vkd3d_select_memory_flags(struct d3d12_device *device, const D3D1
+                         *type_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                     break;
+                 case D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE:
+-                    *type_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++                    *type_flags = vkd3d_bench_l0_sysmem(device, heap_properties) ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                     break;
+                 default:
+                     return E_INVALIDARG;
+@@ -857,6 +857,7 @@ void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_de
+         return;
+     }
+ 
++    vkd3d_memtrace_vk_free(allocation->vk_memory_type, allocation->size, allocation->vk_memory);
+     VK_CALL(vkFreeMemory(device->vk_device, allocation->vk_memory, NULL));
+     rebar_budget = !!(device->memory_info.rebar_budget_mask & (1u << allocation->vk_memory_type));
+ 
+@@ -1023,6 +1024,8 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
+     vkd3d_address_binding_tracker_mark_user_thread();
+ 
+     vr = VK_CALL(vkAllocateMemory(device->vk_device, &allocate_info, NULL, &allocation->vk_memory));
++    vkd3d_memtrace_vk_allocate(device, allocate_info.memoryTypeIndex, allocate_info.allocationSize,
++            vr == VK_SUCCESS, respect_budget, vr == VK_SUCCESS ? allocation->vk_memory : VK_NULL_HANDLE);
+ 
+     if (vr == VK_SUCCESS)
+     {
+diff --git a/libs/vkd3d/memtrace.c b/libs/vkd3d/memtrace.c
+new file mode 100644
+index 00000000..4274a9ce
+--- /dev/null
++++ b/libs/vkd3d/memtrace.c
+@@ -0,0 +1,342 @@
++/*
++ * Bench instrumentation (miles-bench): when VKD3D_MEMTRACE names a file, log the lifetime of
++ * every D3D12 resource and heap plus every VkDeviceMemory allocation as tab-separated lines.
++ * Each creation records the first stack frame outside d3d12core.dll (module!+rva), so an
++ * allocation can be traced back to the function in the game binary that asked for it.
++ *
++ * Line formats (t = milliseconds since the trace was opened):
++ *   MT  type_index  property_flags  heap_index
++ *   MH  heap_index  size  heap_flags
++ *   RC  t ptr kind dim width height depth mips format flags layout heap_type heap_flags
++ *       heap_ptr heap_offset req_size vk_type suballocated exe_rva callers
++ *   RD  t ptr
++ *   HC  t ptr size heap_type cpu_page pool flags vk_type suballocated exe_rva callers
++ *   HD  t ptr
++ *   N   t ptr name
++ *   VA  t vk_type size ok budgeted vk_memory
++ *   VF  t vk_type size vk_memory
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++
++#include "vkd3d_private.h"
++#include "vkd3d_utf8.h"
++
++#include <stdio.h>
++
++static pthread_once_t memtrace_once = PTHREAD_ONCE_INIT;
++static pthread_mutex_t memtrace_lock = PTHREAD_MUTEX_INITIALIZER;
++static FILE *memtrace_file;
++static uint64_t memtrace_t0;
++static uint64_t memtrace_last_flush;
++static unsigned int memtrace_unflushed;
++static bool memtrace_props_logged;
++
++static void memtrace_open(void)
++{
++    char path[VKD3D_PATH_MAX];
++
++    if (!vkd3d_get_env_var("VKD3D_MEMTRACE", path, sizeof(path)) || !*path)
++        return;
++
++    if (!(memtrace_file = fopen(path, "w")))
++    {
++        ERR("memtrace: failed to open %s.\n", path);
++        return;
++    }
++
++    setvbuf(memtrace_file, NULL, _IOFBF, 1 << 20);
++    memtrace_t0 = vkd3d_get_current_time_ns();
++    fprintf(memtrace_file, "# memtrace v1\n");
++    INFO("memtrace: logging to %s.\n", path);
++}
++
++static bool memtrace_enabled(void)
++{
++    pthread_once(&memtrace_once, memtrace_open);
++    return memtrace_file != NULL;
++}
++
++static double memtrace_now_ms(void)
++{
++    return (vkd3d_get_current_time_ns() - memtrace_t0) / 1e6;
++}
++
++/* Caller must hold memtrace_lock. */
++static void memtrace_end_line(void)
++{
++    uint64_t now = vkd3d_get_current_time_ns();
++
++    if (++memtrace_unflushed >= 256 || now - memtrace_last_flush > 1000000000ull)
++    {
++        fflush(memtrace_file);
++        memtrace_unflushed = 0;
++        memtrace_last_flush = now;
++    }
++}
++
++/* Caller must hold memtrace_lock. */
++static void memtrace_log_memory_properties(struct d3d12_device *device)
++{
++    const VkPhysicalDeviceMemoryProperties *props = &device->memory_properties;
++    uint32_t i;
++
++    if (memtrace_props_logged)
++        return;
++    memtrace_props_logged = true;
++
++    for (i = 0; i < props->memoryHeapCount; i++)
++        fprintf(memtrace_file, "MH\t%u\t%"PRIu64"\t%#x\n", i, props->memoryHeaps[i].size, props->memoryHeaps[i].flags);
++    for (i = 0; i < props->memoryTypeCount; i++)
++        fprintf(memtrace_file, "MT\t%u\t%#x\t%u\n", i, props->memoryTypes[i].propertyFlags, props->memoryTypes[i].heapIndex);
++}
++
++#ifdef _WIN32
++struct memtrace_module
++{
++    HMODULE handle;
++    uintptr_t end;
++    char name[64];
++};
++
++static struct memtrace_module memtrace_modules[32];
++static unsigned int memtrace_module_count;
++static HMODULE memtrace_self, memtrace_exe;
++
++/* Caller must hold memtrace_lock. */
++static const struct memtrace_module *memtrace_lookup_module(const void *address)
++{
++    IMAGE_NT_HEADERS *nt;
++    char path[MAX_PATH];
++    const char *base;
++    HMODULE handle;
++    unsigned int i;
++
++    for (i = 0; i < memtrace_module_count; i++)
++    {
++        if ((uintptr_t)address >= (uintptr_t)memtrace_modules[i].handle && (uintptr_t)address < memtrace_modules[i].end)
++            return &memtrace_modules[i];
++    }
++
++    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++            address, &handle))
++        return NULL;
++
++    if (memtrace_module_count == ARRAY_SIZE(memtrace_modules))
++        return NULL;
++
++    nt = (IMAGE_NT_HEADERS *)((char *)handle + ((IMAGE_DOS_HEADER *)handle)->e_lfanew);
++    memtrace_modules[i].handle = handle;
++    memtrace_modules[i].end = (uintptr_t)handle + nt->OptionalHeader.SizeOfImage;
++    GetModuleFileNameA(handle, path, sizeof(path));
++    base = strrchr(path, '\\');
++    snprintf(memtrace_modules[i].name, sizeof(memtrace_modules[i].name), "%s", base ? base + 1 : path);
++    memtrace_module_count++;
++    return &memtrace_modules[i];
++}
++
++/* Writes "\texe_rva\tcallers". Caller must hold memtrace_lock. */
++static void memtrace_write_callers(void)
++{
++    const struct memtrace_module *module;
++    unsigned int i, count, written = 0;
++    uintptr_t exe_rva = 0;
++    void *frames[48];
++    char chain[256];
++    size_t len = 0;
++
++    if (!memtrace_self)
++    {
++        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                (const void *)memtrace_write_callers, &memtrace_self);
++        memtrace_exe = GetModuleHandleA(NULL);
++    }
++
++    chain[0] = '\0';
++    count = RtlCaptureStackBackTrace(1, ARRAY_SIZE(frames), frames, NULL);
++
++    for (i = 0; i < count; i++)
++    {
++        if (!(module = memtrace_lookup_module(frames[i])) || module->handle == memtrace_self)
++            continue;
++
++        if (module->handle == memtrace_exe && !exe_rva)
++            exe_rva = (uintptr_t)frames[i] - (uintptr_t)module->handle;
++
++        if (written < 4 && len < sizeof(chain))
++        {
++            len += snprintf(chain + len, sizeof(chain) - len, "%s%s!+%#"PRIxPTR,
++                    written ? "<" : "", module->name, (uintptr_t)frames[i] - (uintptr_t)module->handle);
++            written++;
++        }
++
++        if (exe_rva && written >= 4)
++            break;
++    }
++
++    fprintf(memtrace_file, "\t%#"PRIxPTR"\t%s", exe_rva, chain);
++}
++#else
++static void memtrace_write_callers(void)
++{
++    fprintf(memtrace_file, "\t0\t");
++}
++#endif
++
++void vkd3d_memtrace_resource_create(struct d3d12_device *device, struct d3d12_resource *resource, const char *kind)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    const D3D12_RESOURCE_DESC1 *desc = &resource->desc;
++    const struct vkd3d_memory_allocation *mem;
++    VkMemoryRequirements requirements;
++    uint64_t req_size, heap_offset = 0;
++    D3D12_HEAP_FLAGS heap_flags;
++    D3D12_HEAP_TYPE heap_type;
++
++    if (!memtrace_enabled())
++        return;
++
++    if (d3d12_resource_is_texture(resource) && resource->res.vk_image)
++    {
++        VK_CALL(vkGetImageMemoryRequirements(device->vk_device, resource->res.vk_image, &requirements));
++        req_size = requirements.size;
++    }
++    else
++        req_size = desc->Width;
++
++    if (resource->heap)
++    {
++        mem = &resource->heap->allocation;
++        heap_type = resource->heap->desc.Properties.Type;
++        heap_flags = resource->heap->desc.Flags;
++        heap_offset = resource->mem.offset - mem->offset;
++    }
++    else
++    {
++        mem = &resource->mem;
++        heap_type = resource->heap_properties.Type;
++        heap_flags = resource->heap_flags;
++    }
++
++    pthread_mutex_lock(&memtrace_lock);
++    memtrace_log_memory_properties(device);
++    fprintf(memtrace_file, "RC\t%.3f\t%p\t%s\t%u\t%"PRIu64"\t%u\t%u\t%u\t%u\t%#x\t%u\t%u\t%#x\t%p\t%"PRIu64"\t%"PRIu64"\t%u\t%u",
++            memtrace_now_ms(), (void *)resource, kind, desc->Dimension, desc->Width, desc->Height,
++            desc->DepthOrArraySize, desc->MipLevels, desc->Format, desc->Flags, desc->Layout,
++            heap_type, heap_flags, (void *)resource->heap, heap_offset, req_size,
++            mem->device_allocation.vk_memory_type, mem->chunk != NULL);
++    memtrace_write_callers();
++    fputc('\n', memtrace_file);
++    memtrace_end_line();
++    pthread_mutex_unlock(&memtrace_lock);
++}
++
++void vkd3d_memtrace_resource_destroy(struct d3d12_resource *resource)
++{
++    if (!memtrace_enabled())
++        return;
++
++    pthread_mutex_lock(&memtrace_lock);
++    fprintf(memtrace_file, "RD\t%.3f\t%p\n", memtrace_now_ms(), (void *)resource);
++    memtrace_end_line();
++    pthread_mutex_unlock(&memtrace_lock);
++}
++
++void vkd3d_memtrace_heap_create(struct d3d12_device *device, struct d3d12_heap *heap)
++{
++    const D3D12_HEAP_DESC *desc = &heap->desc;
++
++    if (!memtrace_enabled())
++        return;
++
++    pthread_mutex_lock(&memtrace_lock);
++    memtrace_log_memory_properties(device);
++    fprintf(memtrace_file, "HC\t%.3f\t%p\t%"PRIu64"\t%u\t%u\t%u\t%#x\t%u\t%u",
++            memtrace_now_ms(), (void *)heap, desc->SizeInBytes, desc->Properties.Type,
++            desc->Properties.CPUPageProperty, desc->Properties.MemoryPoolPreference, desc->Flags,
++            heap->allocation.device_allocation.vk_memory_type, heap->allocation.chunk != NULL);
++    memtrace_write_callers();
++    fputc('\n', memtrace_file);
++    memtrace_end_line();
++    pthread_mutex_unlock(&memtrace_lock);
++}
++
++void vkd3d_memtrace_heap_destroy(struct d3d12_heap *heap)
++{
++    if (!memtrace_enabled())
++        return;
++
++    pthread_mutex_lock(&memtrace_lock);
++    fprintf(memtrace_file, "HD\t%.3f\t%p\n", memtrace_now_ms(), (void *)heap);
++    memtrace_end_line();
++    pthread_mutex_unlock(&memtrace_lock);
++}
++
++void vkd3d_memtrace_set_name(const void *object, const WCHAR *name)
++{
++    char *utf8;
++
++    if (!memtrace_enabled() || !name)
++        return;
++
++    if (!(utf8 = vkd3d_strdup_w_utf8(name, 0)))
++        return;
++
++    pthread_mutex_lock(&memtrace_lock);
++    fprintf(memtrace_file, "N\t%.3f\t%p\t%s\n", memtrace_now_ms(), object, utf8);
++    memtrace_end_line();
++    pthread_mutex_unlock(&memtrace_lock);
++    vkd3d_free(utf8);
++}
++
++void vkd3d_memtrace_vk_allocate(struct d3d12_device *device, uint32_t vk_type, uint64_t size,
++        bool ok, bool budgeted, VkDeviceMemory vk_memory)
++{
++    if (!memtrace_enabled())
++        return;
++
++    pthread_mutex_lock(&memtrace_lock);
++    memtrace_log_memory_properties(device);
++    fprintf(memtrace_file, "VA\t%.3f\t%u\t%"PRIu64"\t%u\t%u\t%#"PRIx64"\n",
++            memtrace_now_ms(), vk_type, size, ok, budgeted, (uint64_t)vk_memory);
++    memtrace_end_line();
++    pthread_mutex_unlock(&memtrace_lock);
++}
++
++static pthread_once_t l0_sysmem_once = PTHREAD_ONCE_INIT;
++static bool l0_sysmem_enabled;
++
++static void l0_sysmem_init(void)
++{
++    char value[8];
++
++    l0_sysmem_enabled = vkd3d_get_env_var("VKD3D_BENCH_L0_SYSMEM", value, sizeof(value)) && value[0] == '1';
++    if (l0_sysmem_enabled)
++        INFO("bench: CUSTOM heaps with MEMORY_POOL_L0 and no CPU access go to system memory.\n");
++}
++
++/* With VKD3D_BENCH_L0_SYSMEM=1, CUSTOM heaps asking for MEMORY_POOL_L0 without CPU access are placed in
++ * system memory on discrete GPUs, as D3D12 does on Windows. Stock vkd3d-proton puts them in VRAM, so a game
++ * that demotes resources out of VRAM this way (Nixxes ports) sees no drop in VRAM usage and keeps demoting. */
++bool vkd3d_bench_l0_sysmem(struct d3d12_device *device, const D3D12_HEAP_PROPERTIES *heap_properties)
++{
++    if (heap_properties->Type != D3D12_HEAP_TYPE_CUSTOM ||
++            heap_properties->MemoryPoolPreference != D3D12_MEMORY_POOL_L0 ||
++            heap_properties->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE)
++        return false;
++
++    pthread_once(&l0_sysmem_once, l0_sysmem_init);
++    return l0_sysmem_enabled && !d3d12_device_is_uma(device, NULL);
++}
++
++void vkd3d_memtrace_vk_free(uint32_t vk_type, uint64_t size, VkDeviceMemory vk_memory)
++{
++    if (!memtrace_enabled())
++        return;
++
++    pthread_mutex_lock(&memtrace_lock);
++    fprintf(memtrace_file, "VF\t%.3f\t%u\t%"PRIu64"\t%#"PRIx64"\n",
++            memtrace_now_ms(), vk_type, size, (uint64_t)vk_memory);
++    memtrace_end_line();
++    pthread_mutex_unlock(&memtrace_lock);
++}
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index 477b3663..696bfd23 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -74,6 +74,7 @@ vkd3d_src = [
+   'device_vkd3d_ext.c',
+   'heap.c',
+   'memory.c',
++  'memtrace.c',
+   'meta.c',
+   'meta_commands.c',
+   'resource.c',
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 78db89c0..5f58f396 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -3974,6 +3974,8 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+ 
++    vkd3d_memtrace_resource_destroy(resource);
++
+     if (resource->flags & VKD3D_RESOURCE_RESERVED)
+         d3d12_resource_wait_for_sparse_init(resource);
+ 
+@@ -4545,6 +4547,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+     vkd3d_queue_timeline_trace_register_instantaneous(&device->queue_timeline_trace,
+             VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_COMMITTED_RESOURCE_ALLOCATION, object->res.cookie.index);
+ 
++    vkd3d_memtrace_resource_create(device, object, "committed");
+     *resource = object;
+     return S_OK;
+ 
+@@ -4783,6 +4786,7 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
+         vkd3d_breadcrumb_tracer_register_placed_resource(heap, object, heap_offset, required_size);
+ #endif
+ 
++    vkd3d_memtrace_resource_create(device, object, "placed");
+     *resource = object;
+     return S_OK;
+ 
+@@ -4883,6 +4887,7 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
+     if (VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS))
+         d3d12_resource_tag_debug_name(object, device, "Reserved Resource");
+ 
++    vkd3d_memtrace_resource_create(device, object, "reserved");
+     *resource = object;
+     return S_OK;
+ 
+diff --git a/libs/vkd3d/utils.c b/libs/vkd3d/utils.c
+index 64c1a738..6a2ad339 100644
+--- a/libs/vkd3d/utils.c
++++ b/libs/vkd3d/utils.c
+@@ -1679,6 +1679,7 @@ HRESULT STDMETHODCALLTYPE d3d12_object_SetName(ID3D12Object *iface, const WCHAR
+     size_t size = 0;
+ 
+     TRACE("iface %p, name %s.\n", iface, debugstr_w(name));
++    vkd3d_memtrace_set_name(iface, name);
+ 
+     if (name)
+         size = sizeof(WCHAR) * (vkd3d_wcslen(name) + 1);
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 03262ed7..c1671ae0 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -5972,6 +5972,8 @@ static inline uint32_t vkd3d_bindless_state_find_set_info_index_fast(struct d3d1
+         return vkd3d_bindless_state_find_set_info_index(&device->bindless_state, fallback_lookup_types);
+ }
+ 
++bool vkd3d_bench_l0_sysmem(struct d3d12_device *device, const D3D12_HEAP_PROPERTIES *heap_properties);
++
+ static inline const struct vkd3d_memory_info_domain *d3d12_device_get_memory_info_domain(
+         struct d3d12_device *device,
+         const D3D12_HEAP_PROPERTIES *heap_properties, bool fallback)
+@@ -5980,8 +5982,10 @@ static inline const struct vkd3d_memory_info_domain *d3d12_device_get_memory_inf
+      * overlap. Need to select memory types appropriately. */
+     if (is_cpu_accessible_heap(heap_properties))
+         return &device->memory_info.cpu_accessible_domain;
++    else if (fallback || vkd3d_bench_l0_sysmem(device, heap_properties))
++        return &device->memory_info.fallback_domain;
+     else
+-        return fallback ? &device->memory_info.fallback_domain : &device->memory_info.non_cpu_accessible_domain;
++        return &device->memory_info.non_cpu_accessible_domain;
+ }
+ 
+ static inline HRESULT d3d12_device_query_interface(struct d3d12_device *device, REFIID iid, void **object)
+@@ -7168,4 +7172,14 @@ static inline void vkd3d_mapped_memory_range_align(const struct d3d12_device *de
+     range->size = min(range->size, size - range->offset);
+ }
+ 
++/* memtrace.c (miles-bench instrumentation, enabled by VKD3D_MEMTRACE=<file>) */
++void vkd3d_memtrace_resource_create(struct d3d12_device *device, struct d3d12_resource *resource, const char *kind);
++void vkd3d_memtrace_resource_destroy(struct d3d12_resource *resource);
++void vkd3d_memtrace_heap_create(struct d3d12_device *device, struct d3d12_heap *heap);
++void vkd3d_memtrace_heap_destroy(struct d3d12_heap *heap);
++void vkd3d_memtrace_set_name(const void *object, const WCHAR *name);
++void vkd3d_memtrace_vk_allocate(struct d3d12_device *device, uint32_t vk_type, uint64_t size,
++        bool ok, bool budgeted, VkDeviceMemory vk_memory);
++void vkd3d_memtrace_vk_free(uint32_t vk_type, uint64_t size, VkDeviceMemory vk_memory);
++
+ #endif  /* __VKD3D_PRIVATE_H */
