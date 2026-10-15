@@ -37,10 +37,10 @@ export VKD3D_BENCH_LIGHTGRID_SPARSE=1
 export VKD3D_BENCH_SKIN_SPARSE=1
 export VKD3D_CONFIG_BASE=
 export MEMTRACE=0
-# The frozen checkpoint build (S13: checkpoint-s12 + patches/vkd3d-proton-checkpoint-s13.patch,
-# build/checkpoint-s13/SHA256SUMS), not build/memtrace: experiments rebuild that one, and a play
-# session must never pick them up. S12 stays in build/checkpoint-s12 (PLAY_DLLS to go back).
-export BENCH_DLLS=${PLAY_DLLS:-$bench/build/checkpoint-s13/bin}
+# The frozen checkpoint build (S14: checkpoint-s13 + patches/vkd3d-proton-checkpoint-s14.patch,
+# build/checkpoint-s14/SHA256SUMS), not build/memtrace: experiments rebuild that one, and a play
+# session must never pick them up. S13 / S12 stay in build/checkpoint-s1{3,2} (PLAY_DLLS to go back).
+export BENCH_DLLS=${PLAY_DLLS:-$bench/build/checkpoint-s14/bin}
 "$bench/bench/run.sh" "$name"
 cp "$HOME/.local/share/wine/pfx/drive_c/users/zaid/Documents/Marvel's Spider-Man Miles Morales/Marvel's Spider-Man Miles Morales.log" \
     "$bench/captures/$name/game.log" 2>/dev/null || true

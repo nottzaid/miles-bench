@@ -870,7 +870,47 @@ thread at most every 10 s. Config bench/configs/s13-learned.env; S12 A/B arm ben
   Open: the TV modeset on enter (extended mode). Options: keep the TV off during short desktop visits while the game
   runs, or take the TV off before Super+G reveals the game (a ~0.3 s later switch instead of a
   stall). Not decided.
+- Textures in system RAM (item 3, 2026-10-15, captures/tex1 tex2, S13, gaming mode paused): the GPU
+  reads 2.08 GB/s over PCIe in the fight (peak 3.9, ~50 MB a frame) with SM 90% / memory controller
+  24% busy: it waits on system memory. But what lives there is already the coldest data per MiB
+  (descriptor-QA counts, 2026-10-13: sysmem textures 2-7k accesses/MiB, ManagedBuffer ~4.75k, VRAM
+  textures 250-860k). Demoted 916 MiB = 573.6 MiB of L0 heaps in SYS + 342.8 MiB that vkd3d already
+  put in VRAM. Placed resources fill 2755 of 3651 MiB of heap space, but 708 MiB of the gap is the
+  light grid and skinning heaps (backed lazily already) and ~160 MiB is spread over ~2000 small
+  heaps the engine fills as it streams. Vertices cannot be cached per page (NVIDIA sparse buffers
+  are VRAM-only, the vertex views span the whole heap). No large lossless lever here: the PCIe wait
+  is what fitting this game into 3 GB costs.
 - Checkpoint S13 (2026-10-15): binaries build/checkpoint-s13/bin (SHA256SUMS), source = checkpoint-s12
-  + patches/vkd3d-proton-checkpoint-s13.patch (not committed). bench/play.sh plays it (PLAY_DLLS=
+  + patches/vkd3d-proton-checkpoint-s13.patch (committed: vkd3d fork tag checkpoint-s13). bench/play.sh plays it (PLAY_DLLS=
   build/checkpoint-s12/bin goes back). Play sessions share learned/ with the bench, so open-world
   play raises the light grid / skinning peaks, the reserve and the hold for later sessions.
+- Adaptive particle batch (item 2, 2026-10-15, dropped before building): copies 16-31 only on a
+  machine that never ran short of VRAM. Not worth it: 16 -> 32 measured +0.18 fps (v5-pk, 50.57 vs
+  50.75, noise) for 48 MiB more VRAM; on this card it changes nothing (a reserve is learned); and a
+  first session on a tight machine would hold the extra 48 MiB until VRAM ran short, which would
+  then be learned into the reserve, and learned values only rise. No way to free the copies safely
+  mid-session without fence tracking.
+
+## S14 (2026-10-15): index cache eviction fix (checkpoint-s14)
+
+- Bug (idxcache.c idxc_alloc_locked, since the cache began): the eviction loop compared run_of[i]
+  with the run being evicted while it cleared run_of[i], so it stopped after the first page and the
+  rest of each evicted run stayed attached to it: counted as used, never reusable until the ring
+  wrapped onto the run's first page again. The cache refused runs it had room for.
+- New frame trace lines: IA (cache MiB held by runs last drawn 0, 1, 2, 3, 4-7, 8+ presents ago,
+  free MiB) and IS (requests / failures per run size class, largest gap at a failure).
+- Fight, S13 vs fixed (ia1/ia2 captures): refusals 2153/s -> 304/s average, seconds with any
+  refusal 135 -> 14; true hot set (runs drawn in the last 8 presents) 8.5 MiB, not the 15.3 MiB the
+  orphans made it look like. Verify run (ia3v, VKD3D_BENCH_INDEX_CACHE_VERIFY=1): 636,136 hits
+  compared byte for byte, 0 mismatches. It never served wrong data before either: orphans were
+  only lost space.
+- Series v16 (2026-10-15 05:07-05:50, ABBA x2, FIGHT_SAVES=3, gaming mode paused; A = s13-frozen.env,
+  B = the fix with S13's read-only learned values, bench/configs/candidate-vs-s13.env):
+  A 41.99 / 42.66 / 43.98 / 44.89 (mean 43.38), B 43.35 / 42.86 / 43.89 / 44.26 (mean 43.59, +0.5%:
+  equal within noise; fps drifted up through the series, which ABBA cancels). p99 38.0 -> 37.1 ms,
+  frames > 40 ms 257 -> 238, > 100 ms 27 -> 28; failed VRAM allocations A 2/6/0/0, B 0 in all four.
+- Checkpoint S14: vkd3d fork commit 375c0f99, tag checkpoint-s14 (patch:
+  patches/vkd3d-proton-checkpoint-s14.patch); binaries build/checkpoint-s14/bin (SHA256SUMS), the
+  read-only learned copy = S13's; config bench/configs/s14-frozen.env. bench/play.sh plays S14.
+- Review: the fix is correct. Its new "largest gap" stat walks the whole ring on every
+  failed search under the lock (16K steps x ~300 failures/s): measured inside B anyway, to be gated.
