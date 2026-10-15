@@ -61,6 +61,9 @@ fi
 export VKD3D_CONFIG=${VKD3D_CONFIG_BASE-log_memory_budget}${VKD3D_CONFIG_EXTRA:+,$VKD3D_CONFIG_EXTRA}
 export VKD3D_DEBUG=info
 export VKD3D_LOG_FILE=$(winpath "$cap/vkd3d.log")
+# Sizes the bench features learned in earlier sessions (learned.c): one file for every run and play
+# session, whatever directory the game starts in.
+export VKD3D_BENCH_LEARNED_PATH=${VKD3D_BENCH_LEARNED_PATH:-$bench/learned}
 
 "$bench/bench/sample.sh" "$cap/samples.tsv" &
 sampler_pid=$!

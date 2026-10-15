@@ -760,3 +760,117 @@ Rollback point for the next experiments:
   ssd3 and v13-S12). bench/play.sh plays that copy (PLAY_DLLS overrides), never build/memtrace.
 - Back to it: `git -C src/vkd3d-proton switch miles-bench && git -C src/vkd3d-proton reset --hard
   checkpoint-s12`, rebuild, or just run with BENCH_DLLS=build/checkpoint-s12/bin.
+
+## Gaming mode (desktop side, 2026-10-14): `gaming-mode` in ~/Projects/dotfiles
+
+Not RE: a desktop change (dotfiles `files/bin/gaming-mode`, hooked from Hyprland), measured here.
+While the gaming workspace is shown with a window, it stops the shell (Noctalia, with a no-fade
+layer rule first), closes terminals over session servers (reattached after), force-disconnects the
+other screens (sysfs, root helper), and freezes + swaps out every other app unit.
+- NVIDIA's VK_EXT_memory_budget heapBudget = 3072 - used(all processes) - 69 MiB reserved, so every
+  MiB the desktop frees goes straight into the game's DXGI budget.
+- Series gm1 (`bench/gmseries.sh`, run as its own app unit; game ON SCREEN both arms, S12 frozen
+  DLLs, warm-up W0 then AB/BA/AB; A = gaming mode paused, B = on): `bench/gmsum.py gm1`.
+  fps 44.35 -> 45.37 (+2.3%, every B above every A, closest pair 0.08 apart); game Video Budget
+  2245 -> 2752 MB (+506), Video Usage 2324 -> 2785; pinned sysmem ~2130 -> ~1680 MiB; swap-ins
+  22.4K -> 6.0K per run (~78/s -> ~21/s); game major faults -31%; frames > 100 ms 10.3 -> 7.3.
+  Direct scanout active in both arms during the fight (Hyprland never composites the game).
+- Demoted stays ~915 MB in both arms: the engine reads "VMEM Budget" once at startup (2466-2526 MB
+  in both arms: gaming mode engages when the window is shown, i.e. after that read). Freed VRAM
+  during play goes to vkd3d allocations that otherwise fall back to sysmem (as in v8-lg2).
+  Next: engage gaming mode before the game starts and measure whether the engine keeps more
+  textures in VRAM.
+- Series gm2 (B = on when shown, C = on from the game's first instruction via `gaming-mode launch`,
+  BENCH_WRAP in run.sh; warm-up then BC/CB/BC): the engine's startup "VMEM Budget" was 2997 MB in C
+  vs 2465 in B (+532), yet Demoted stayed 1070 -> ~915 MB in both and fps C 45.28 vs B 44.92
+  (+0.8%, ranges overlap: noise). The engine's texture demotion does not follow the VRAM budget at
+  startup or live: it is the engine's own decision (a game-side lever, not a desktop one).
+
+## Portability audit (2026-10-15): can S12 be worse than stock on another machine?
+
+Read against: more VRAM, plenty of RAM and no swap, faster CPU or GPU, AMD/Intel/UMA, other
+resolutions, another game build, with or without gaming mode. Gains do not depend on gaming mode
+(all measured on the plain desktop; the patches read the live budget). Per kept step:
+- Inert or better everywhere: VRAM reserve (refuses only when usage + size + reserve > budget,
+  memory.c vkd3d_bench_vram_reserve_refuses), gdec (build + byte checked; MOVNTDQA on non-WC memory
+  is a plain load), pdraw, lazy heaps, discard keep (command.c discard_attachment_barrier: vkd3d puts
+  no barrier between two ordinary passes writing one RT either, so the discard case is ordered as
+  every RT write already is; skipping UNDEFINED keeps valid compression metadata), particle batching
+  (GPU side; its CPU cost where the CPU is the limit is unmeasured).
+- dxil-spirv change: descriptor-QA counting only; play DLLs come from build/memtrace,
+  enable_descriptor_qa=false, so not compiled in.
+- Defects on other setups (none affects this machine):
+  - index cache: engine_patch_init returns on an unknown exe build before installing the geometry
+    write hooks, but vkd3d_index_cache_wanted checks only env + heap shape, so after a game update
+    the cache would run without invalidation (stale indices possible). Also no UMA check.
+  - light grid / skinning: heap.c shrinks the heap before checking sparse support;
+    vkd3d_lightgrid_create_placed returns E_INVALIDARG without an internal sparse queue, so the
+    game's CreatePlacedResource fails at startup.
+- Costs with nothing to gain: dropdst reads pagemap per copy >= 16 KiB even when nothing is
+  swapped (~1% of a core); the DXGI budget hook always hides 2 light grid + 2 skinning margins
+  (~80 MiB); index cache lookups ~1.8% of the render thread (matters only when it is the limit).
+- Fixed sizes tuned to this card: reserve 192 MiB (late RTs scale with resolution), light grid
+  initial 5120 / margin 512 pages, skinning 32 / 8 MiB per half, index cache 64 MiB, batch 16.
+Plan: every step acts on a measured need or is identical to stock; test the stronger-machine
+cases here with live A/B at lower resolution (CPU-bound) and lower texture quality (VRAM to spare).
+
+## S13 (2026-10-15): sizes measured instead of fixed, gates for other machines (build/memtrace)
+
+Code (src/vkd3d-proton, uncommitted on top of checkpoint-s12): learned.c keeps per-exe-build values in
+learned/vkd3d-proton.MilesMorales.exe.learned (VKD3D_BENCH_LEARNED_PATH, set by run.sh), written by a
+thread at most every 10 s. Config bench/configs/s13-learned.env; S12 A/B arm bench/configs/s12-frozen.env.
+- Gates: index cache needs the geometry write hooks and a non-UMA device; light grid / skinning need
+  sparse buffers (checked before the heap shrinks) and skinning all 8 redirects; dropdst skips pagemap
+  reads while the game's VmSwap is 0 (re-read every 100 ms).
+- Light grid / skinning initial backing = learned peak + one margin (whole buffer before anything is
+  learned); peaks recorded on every check. Seeded from logged sessions: 4342 pages, 25.6 MiB/half.
+- Budget the game sees: growth hold now ramps with need, PLUS a learned hold. Lesson: S12's fixed
+  2+2 margins (80 MiB) also kept the texture streamer off vkd3d's later VRAM (the streamer runs
+  70-95 MiB over whatever budget it is told). Growth-only hold (6 MiB): 119-269 failed VRAM
+  allocations, 39.2-40.0 fps (v14-S13-1, v14-S13r192-1); S13 + hold 80 + reserve 192 forced: 0 fails,
+  43.09 (v14-S13h80-1). The hold is raised live by each failed non-cold VRAM allocation (largest in a
+  2 s window; the driver refused 6 MiB with ~20 MiB of budget left, so a refusal always counts).
+- VRAM reserve (VKD3D_BENCH_VRAM_RESERVE=1): need = reserve - least VRAM left after any non-cold VRAM
+  allocation after VRAM first ran short (failure = negative). Counting only RT/DS/UAV/buffer demand
+  was wrong: the game's texture heaps also eat the reserve. S12 operating point leaves 22.6 MiB at the
+  tightest moment (v14-S13h80-1). Seeded at S12's 192 MiB reserve / 80 MiB hold; they only rise
+  (max over sessions); trimming the slack needs several sessions of evidence.
+- Bench hygiene: Steam's web helper took ~240 MiB of VRAM (desktop 915 vs 673 MiB before the run,
+  v14-learn2); a Super+G during a run engaged gaming mode mid-fight (v14-learn). Runs now pause
+  gaming-mode (pause/resume) and check desktop VRAM first.
+- Series v15 (same evening, ABBA, FIGHT_SAVES=3, final build): S12 43.27 / 41.87 (mean 42.57), S13
+  42.69 / 42.66 (mean 42.68, +0.25%: equal); 0 failed VRAM allocations in all four; S13 pins ~15 MiB
+  less system RAM. Earlier S12 run the same evening: 42.70.
+- Gaming mode transitions hitch the game (v14-learn, by accident): enter -> slow frames up to 435 ms,
+  leave -> 398 ms, re-enter -> 179 ms. Taken apart on 2026-10-15 (captures/gmt1: the S13 game held
+  still at 60 Hz, hidden, each step timed against its frames; one-off driver scripts,
+  `gaming-mode` traced with PS4=$EPOCHREALTIME):
+  - Most of v14-learn's "7 s" was the game's own pre-fight scene (48 ms frames before the Super+G).
+  - The big stalls are the TV's modeset, whichever way it is done: connector forced off 97-226 ms
+    worst frame, back on 106-208 ms; Hyprland DPMS off 292 ms (and frees no VRAM; forcing the
+    connector off frees 328 MiB). Hyprland's thread is blocked in the commit, so the game's
+    presents stall with it. On enter the game is on screen: this is the visible hitch.
+  - Swapping out frozen apps is not a hitch source: 600 MiB reclaimed synchronously at normal
+    priority, worst frame 21 ms (two busy cores for 2 s: 27 ms). Moved to the background at idle
+    priority anyway, so enter no longer holds the lock while a big app swaps out.
+  - A window mapping or closing on a visible workspace costs 30-110 ms frames even at nice 19
+    (compositor side, not CPU): kitty's start/close, Noctalia's start. On leave the game is hidden.
+  - Leave took 2.2 s, mostly `running_like` forking `cmp` per process (0.35 s per scan, repeated
+    while waiting): now compared in the shell (11 ms), leave 1.1 s, terminal back at 0.26 s,
+    extra frame time during leave 733 -> 440 ms.
+  - Deploying dotfiles (home-manager switch) reloads Hyprland's config, which drops the bench's
+    runtime rule and render_unfocused_fps (the hidden game fell to 15 fps): re-run
+    `bench/hyprbench.py setup` after a deploy during a run.
+  - Mirror mode (display-mode, Super+Shift+M: the TV mirrors HDMI-A-1 at 1080p60): gaming mode used
+    to cut the TV there too (only the game's sound kept a screen), so the game vanished from it.
+    Fixed 2026-10-15: a screen mirroring the game's screen is kept, so mirror mode has no TV
+    modeset at all on Super+G. Its cost instead: Hyprland 0.56.2 never scans out directly on a
+    mirrored monitor (Monitor.cpp isDSBlocked, DS_BLOCK_MIRROR), so every game frame is copied
+    (monitor + TV). Not measured yet.
+  Open: the TV modeset on enter (extended mode). Options: keep the TV off during short desktop visits while the game
+  runs, or take the TV off before Super+G reveals the game (a ~0.3 s later switch instead of a
+  stall). Not decided.
+- Checkpoint S13 (2026-10-15): binaries build/checkpoint-s13/bin (SHA256SUMS), source = checkpoint-s12
+  + patches/vkd3d-proton-checkpoint-s13.patch (not committed). bench/play.sh plays it (PLAY_DLLS=
+  build/checkpoint-s12/bin goes back). Play sessions share learned/ with the bench, so open-world
+  play raises the light grid / skinning peaks, the reserve and the hold for later sessions.

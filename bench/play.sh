@@ -24,7 +24,9 @@ if pgrep -x MilesMorales.ex >/dev/null; then
     exit 1
 fi
 
-export VKD3D_BENCH_VRAM_RESERVE_MB=192
+# S13: the VRAM reserve, the budget held back from the game and the light grid / skinning backing are
+# sized from what earlier sessions measured (learned/, see run.sh), not fixed (NOTES.md, S13).
+export VKD3D_BENCH_VRAM_RESERVE=1
 export VKD3D_ENGINE_PATCH=gdec,dropdst
 export VKD3D_BENCH_INDEX_CACHE=1
 export VKD3D_BENCH_PARTICLE_BATCH=16
@@ -35,9 +37,10 @@ export VKD3D_BENCH_LIGHTGRID_SPARSE=1
 export VKD3D_BENCH_SKIN_SPARSE=1
 export VKD3D_CONFIG_BASE=
 export MEMTRACE=0
-# The frozen checkpoint build (src/vkd3d-proton tag checkpoint-s12, build/checkpoint-s12/SHA256SUMS),
-# not build/memtrace: experiments rebuild that one, and a play session must never pick them up.
-export BENCH_DLLS=${PLAY_DLLS:-$bench/build/checkpoint-s12/bin}
+# The frozen checkpoint build (S13: checkpoint-s12 + patches/vkd3d-proton-checkpoint-s13.patch,
+# build/checkpoint-s13/SHA256SUMS), not build/memtrace: experiments rebuild that one, and a play
+# session must never pick them up. S12 stays in build/checkpoint-s12 (PLAY_DLLS to go back).
+export BENCH_DLLS=${PLAY_DLLS:-$bench/build/checkpoint-s13/bin}
 "$bench/bench/run.sh" "$name"
 cp "$HOME/.local/share/wine/pfx/drive_c/users/zaid/Documents/Marvel's Spider-Man Miles Morales/Marvel's Spider-Man Miles Morales.log" \
     "$bench/captures/$name/game.log" 2>/dev/null || true
