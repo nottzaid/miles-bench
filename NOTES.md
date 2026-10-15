@@ -914,3 +914,122 @@ thread at most every 10 s. Config bench/configs/s13-learned.env; S12 A/B arm ben
   read-only learned copy = S13's; config bench/configs/s14-frozen.env. bench/play.sh plays S14.
 - Review: the fix is correct. Its new "largest gap" stat walks the whole ring on every
   failed search under the lock (16K steps x ~300 failures/s): measured inside B anyway, to be gated.
+
+
+## S15 (2026-10-15): clear keep + review fixes (checkpoint-s15)
+
+- Where the barrier time goes (v12-S9-gt GN notes): of ~1.2-2.4 ms/frame of
+  "empty" GPU segments, the costly vkd3d-internal ones are (a) the particle phases (work hidden in
+  secondaries), (b) one barrier per frame right before the G-buffer pass that transitions 4 colour
+  targets from UNDEFINED: 121-131 us at the fight's 968x544, 276-284 us at 1080p, (c) the depth
+  buffer's UNDEFINED transition (24-77 us), (d) the present blit (87 us). Layout changes between
+  known layouts cost 2-10 us; it is UNDEFINED that NVIDIA pays for.
+- Why: vkd3d transitions every full clear of a *placed* render target from UNDEFINED (another
+  resource on the same memory may have written it). The engine places each G-buffer target in a
+  heap of its own together with 11 smaller dynamic-resolution variants of it, all at offset 0
+  (memtrace tex2), so all of them may alias.
+- Probe (s15-ck1, still scene, live ABBA via features 0x1000): skip it when the heap's last clear
+  was the same resource: 57.53 -> 58.42 fps (+1.6%, every on-window above every off-window),
+  ~18 kept clears per frame; screenshots on/off within the scene's own animation noise.
+- Kept version (`VKD3D_BENCH_CLEAR_KEEP=1`, command.c "clear keep"): a heap qualifies while all it
+  ever held are single-subresource RT/DS textures (UAV access allowed, no simultaneous access), never
+  tile-mapped, only used from direct lists on one queue. D3D12 requires the first operation on an
+  RT/DS texture after another resource used its memory to be a Clear, Discard or Copy, all of which
+  vkd3d sees, so writes it cannot see (UAVs through descriptors) only ever come from the owner. Every use of such a resource in a list (all of
+  d3d12_command_list_track_resource_usage: render passes, clears, discards, copies, resolves,
+  barriers; reads count too) is an event; ExecuteCommandLists replays each list's events in
+  submission order, giving the heap's GPU-order owner and whether a clear transitioned it from
+  UNDEFINED since it became owner. A full clear keeps the layout only if that GPU-order state says
+  the cleared resource owns and initialized the memory, no other unsubmitted list has used the heap,
+  and nothing else in this list used it first. A kept clear whose list is submitted after another
+  list that used the heap (out-of-order submission) fails the replay check: ERR, feature off.
+- Review fixes in the same build (a review of S13/S14; each checked against the code first):
+  - learned.c: a first raise of a key racing a smaller one could leave the smaller value (CAS loop on
+    "unknown"): fixed. Values that no memory size can have (negative, > 1 TiB) are ignored. The
+    writer thread pins the DLL. The file now records the GPU (vendor, device, VRAM heap size): a
+    file learned on another GPU is dropped for later sessions. Sessions that force the reserve or
+    the hold (VKD3D_BENCH_VRAM_RESERVE_MB/_TEXHEAPS/_CHUNKS, VKD3D_BENCH_BUDGET_HOLD_MB) no longer
+    write the reserve or the hold.
+  - Integrated GPUs: no VRAM reserve, no budget hold, no index cache (deviceType, not only UMA).
+  - Light grid / skinning: a failed growth used to leave "wanted" at its target (up to the whole
+    buffer after a failed initial backing), so the budget hook hid that much VRAM from the game for
+    the rest of the session; now only what the pages in use need stays wanted. A growth the game
+    needs that finds no VRAM raises the budget hold like any other failed VRAM allocation.
+  - Lazy backing (learned peak + margin) only where VRAM has run short before (a reserve is
+    learned); elsewhere both buffers are backed whole, as stock, so a scene no earlier session
+    reached can never meet a growth that finds no VRAM on a big card.
+  - Not changed, with reasons: max(growth room, hold) is deliberate (the hold is a floor that
+    replaced S12's fixed 80 MiB growth margins; 0 light-grid losses in v15/v16). Refusals count
+    toward the hold even with budget left (the driver refused 6 MiB with ~20 MiB left). The "largest
+    gap" stat costs ~30 us per failed search that gets past fail-fast (about one per present).
+  - Index cache, verify mode: every cached draw now also records the run and generation it used, and
+    ExecuteCommandLists checks that the source pages were not written and the run not evicted
+    between recording and submission (the reviewer's "CPU write after record" / "late execution").
+- s15-ck2 (safe version, UAV-capable targets excluded): +0.5% (58.22 -> 58.52, every on-window above
+  every off-window), but only ~290 kept clears/s vs ~1050/s in the probe: most dynamic-resolution
+  targets allow UAV access (flags 0x5). Relaxed on the D3D12 initialization rule above (s15-ck3).
+- s15-ck3 (relaxed, kept version): off 57.65 / 58.87 / 58.90 / 58.85, on 58.84 / 59.52 / 59.43 /
+  59.45 (+1.3%; +1.0% leaving out the first pair, which ran while the scene was still settling);
+  ~950 kept clears/s in steady state, 0 failed GPU-order checks; screenshots off/on 50.9 / 57.8 dB
+  vs on/on 50.8 dB and off/off 57.1 dB (the scene's own animation).
+- Review round 2 (clear keep), applied:
+  - A kept clear replayed on a heap that has since stopped qualifying is a failed check (it was only
+    checked for owner/initialized before).
+  - Second queue / non-direct list: the first use of a qualifying heap from a non-direct list, or
+    the first replayed event on a second queue, makes the heap stop qualifying; if a kept clear was
+    ever recorded on it, clear keep goes off for the session (fences, not this replay, order queues).
+  - Out of memory growing a list's event or heap array: the heap stops qualifying (a missing event
+    would hide a use from the replay).
+  - Shared heaps (SHARED, SHARED_CROSS_ADAPTER) and heaps opened from a host address never qualify.
+  - Per-list cost: one record per (list, heap) with the first and last resource and a "mixed" flag
+    replaces the scan of the list's events; a use repeating the list's last use of the heap by the
+    same resource is not stored.
+  - DISCARD_KEEP (S11) skipped the UNDEFINED barrier of every discarded render target, placed ones
+    included, and a discard is how D3D12 activates a placed target after an alias, so that skip was
+    only safe by luck. Now it applies to committed targets as before, and to placed ones only when
+    clear keep proves the target owns and initialized the memory (a discard is then a kept clear;
+    otherwise it transitions from UNDEFINED and counts as the initialization).
+  - Depth: kept depth clears transition (if the depth layout must change) from the layout the
+    resource has, like the render pass would, instead of from UNDEFINED. Only a clear covering
+    every aspect counts as an initialization (depth-stencil formats have two planes, so they never
+    qualify anyway: single-subresource rule).
+  - Not changed (residual, documented): a list submitted out of order whose kept clear fails the
+    replay check has already been recorded, so that one submission runs with the kept clear (the
+    check turns the feature off for everything after it; the fix would split command buffers at
+    every clear). The learned file belongs to the first GPU the game creates a device on (hybrid
+    laptops that switch GPUs relearn: values recorded on another GPU are zeroed).
+- v17 fight A/B (S14 frozen vs the build before the round-2 edits, ABBA x2, 3rd autosave): A 44.46 /
+  45.55 / 44.71 / 42.38 = 44.28, B 44.52 / 43.72 / 45.20 / 44.43 = 44.47 fps (+0.4%, inside the
+  fight's run-to-run spread); p99 35.6 vs 36.4 ms, frames over 40 ms 51.5 vs 49, over 100 ms 6.75 vs
+  7, 0 light-grid losses, same demoted MiB; failed 6 MiB VRAM allocations A 0/4/0/2, B 0/0/2/6 (the
+  same small allocation, in both arms). ~91% of full clears of placed targets kept, 0 failed checks.
+- Review round 3 found a real bug in the round-2 dedupe: a new (list, heap) record started with
+  last_id = the resource, so the first use of a heap in a list that already had other events was
+  dropped as a "repeat", hiding an activation by copy/resolve/UAV clear from the replay (a later
+  clear of the aliased target could then be kept with no ERR). Fixed (last_id starts at 0);
+  confirmed by the reviewer. s15-ck4 (pre-fix build): +2.6%; not used.
+- s15-ck5 (final build, static scene, live A/B of the bit): off 58.09 / 58.11 / 58.00 / 57.84, on
+  59.48 / 59.41 / 59.00 / 59.43: 58.01 -> 59.33 fps (+2.3%, every on-window above every off-window).
+  The off arm is now slower than S14 by the discard fix (placed render targets transition from
+  UNDEFINED on discard again unless clear keep proves them), so the fight A/B against frozen S14
+  is the measure that counts. Steady state: ~57,000 kept per 30 s against 30 transitions; 0 failed
+  checks, never off; screenshots off/on 50.5 / 55.8 dB vs on/on 50.3 dB and off/off 57.1 dB.
+- v18 fight A/B (S14 frozen vs the final build, staged as build/s15-staged; ABBA x2, 3rd autosave):
+  A 44.41 / 43.02 / 42.60 / 43.18 = 43.30, B 44.43 / 44.83 / 43.38 / 44.36 = 44.25 fps (+2.2%); p95
+  30.1 -> 29.9, p99 36.8 -> 36.5 ms, frames over 40 ms 52.5 vs 52.8 per run, over 100 ms 6.0 vs 7.0,
+  worst 118 vs 122 ms, 0 light-grid losses. The >100 ms frames are the same fight moments in every
+  run of both arms (2-3 frames at each autosave / phase change), none next to an allocation event.
+  ~91% of full clears of placed targets kept, 0 failed checks, never off.
+- Failed VRAM allocations (the game's 6.1 MiB heaps; each burst raises the budget hold by 6.1 MiB;
+  first try ~3.5 ms, retries ~0.05 ms): v18 A 0/0/0/4, B 0/0/16/14 (v17: A 0/4/0/2, B 0/0/2/6).
+  Checked: vkd3d's own accounting (heap #0 usage through loading, light grid 4865 pages, skinning
+  36 MiB, reserve 192 MiB, hold 80 MiB) is identical in B2/B6/B7/A8; other processes held 525 MiB in
+  every run. The difference is the game's own VRAM in v18-B6/B7 (+32 MiB, already 20 s before the
+  fight, i.e. from loading), absent from B2/B3 on the same build and from v17's B runs, while S14 runs
+  show the same spread in the game's own telemetry (Video Usage v18-A1 2533, v17-A8 2526 MiB vs
+  2485). Taken as run variance (nothing in S15 allocates); a confirmation series follows (v19).
+- Checkpoint: fork commit 012433f4, tag checkpoint-s15 (diff vs checkpoint-s14 =
+  patches/vkd3d-proton-checkpoint-s15.patch, byte-identical to the diff the v18 build was made
+  from); binaries build/checkpoint-s15/bin (SHA256SUMS; d3d12core b28f5086..., d3d12 5a9cc229...,
+  unchanged), read-only learned copy = S14's; config bench/configs/s15-frozen.env. bench/play.sh
+  plays S15 (VKD3D_BENCH_CLEAR_KEEP=1). Back to S14: PLAY_DLLS=build/checkpoint-s14/bin.
