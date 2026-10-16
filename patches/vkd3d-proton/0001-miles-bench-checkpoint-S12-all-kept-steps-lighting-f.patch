@@ -1,3 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zaid <nottzaid@tutamail.com>
+Date: Wed, 14 Oct 2026 18:32:07 +0300
+Subject: [PATCH 1/7] miles-bench checkpoint S12: all kept steps, lighting fix,
+ instrumentation
+
+VRAM reserve, geometry decompression fix, index cache (fail-fast), particle
+batching, discard barriers, particle draw constants, lazy descriptor heaps,
+dropdst page drops, sparse light grid and skinning buffer with larger initial
+backing (5120 pages / 32 MiB), memtrace/frametrace/gputime/benchinput.
+Fight bench on the SSD: 25.2 -> 42.3 fps (v13-S0 vs v13-S12).
+---
+ libs/d3d12core/main.c               |    5 +
+ libs/vkd3d/benchinput.c             |  339 +++++
+ libs/vkd3d/command.c                | 2098 ++++++++++++++++++++++++--
+ libs/vkd3d/descriptor_debug.c       |  106 +-
+ libs/vkd3d/device.c                 |   39 +
+ libs/vkd3d/enginepatch.c            | 2136 +++++++++++++++++++++++++++
+ libs/vkd3d/geomirror.c              |  384 +++++
+ libs/vkd3d/gputime.c                |  639 ++++++++
+ libs/vkd3d/heap.c                   |   49 +
+ libs/vkd3d/idxcache.c               |  448 ++++++
+ libs/vkd3d/lightgrid.c              |  470 ++++++
+ libs/vkd3d/memory.c                 |  223 ++-
+ libs/vkd3d/memtrace.c               |  477 ++++++
+ libs/vkd3d/meson.build              |    8 +
+ libs/vkd3d/resource.c               |  367 ++++-
+ libs/vkd3d/skinbuf.c                |  562 +++++++
+ libs/vkd3d/state.c                  |   83 ++
+ libs/vkd3d/swapchain.c              |    5 +
+ libs/vkd3d/utils.c                  |    1 +
+ libs/vkd3d/vkd3d_descriptor_debug.h |    6 +-
+ libs/vkd3d/vkd3d_private.h          |  253 +++-
+ subprojects/dxil-spirv              |    2 +-
+ 22 files changed, 8564 insertions(+), 136 deletions(-)
+ create mode 100644 libs/vkd3d/benchinput.c
+ create mode 100644 libs/vkd3d/enginepatch.c
+ create mode 100644 libs/vkd3d/geomirror.c
+ create mode 100644 libs/vkd3d/gputime.c
+ create mode 100644 libs/vkd3d/idxcache.c
+ create mode 100644 libs/vkd3d/lightgrid.c
+ create mode 100644 libs/vkd3d/memtrace.c
+ create mode 100644 libs/vkd3d/skinbuf.c
+
 diff --git a/libs/d3d12core/main.c b/libs/d3d12core/main.c
 index fa299e33..a01d21eb 100644
 --- a/libs/d3d12core/main.c
@@ -10005,9 +10049,9 @@ index 03262ed7..28d2b84b 100644
 +
  #endif  /* __VKD3D_PRIVATE_H */
 diff --git a/subprojects/dxil-spirv b/subprojects/dxil-spirv
-index cc75a0c9..c015cfc3 160000
+index cc75a0c9..6d25da1b 160000
 --- a/subprojects/dxil-spirv
 +++ b/subprojects/dxil-spirv
 @@ -1 +1 @@
 -Subproject commit cc75a0c98d34d7bcc03560527c799b52e48b4d1f
-+Subproject commit c015cfc3e016e8fe6274a43bd3843a3475a5ed21
++Subproject commit 6d25da1bdb0edc2ea85496940163a83d4db14774

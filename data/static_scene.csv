@@ -1,0 +1,5 @@
+arm,order,label,fps_round1,fps_round2
+A,0,Unpatched,30.17,30.80
+B,1,"+ VRAM reserve, geometry fix, index cache, particle batching",47.41,48.75
+C,2,"+ discard barriers, particle draw constants",47.48,48.24
+D,3,+ lazy descriptor heaps (all of S5),49.44,49.56

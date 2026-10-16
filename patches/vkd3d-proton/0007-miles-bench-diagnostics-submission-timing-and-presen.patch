@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zaid <nottzaid@tutamail.com>
+Date: Thu, 15 Oct 2026 18:31:00 +0300
+Subject: [PATCH 7/7] miles-bench diagnostics: submission timing and present
+ timing
+
+- gputime: each sampled command buffer's GS line also carries the time
+  the game handed it to ExecuteCommandLists, the return of
+  vkQueueSubmit2, and the submit's waits and signals (first two wait
+  semaphores, first signal semaphore), to split GPU idle into the game
+  being late, vkd3d's queue thread, and the driver.
+- VKD3D_BENCH_PRESENT_TIMING=1: one frame-trace line per present with
+  the time spent acquiring, submitting the blit and in vkQueuePresentKHR
+  on the queue thread.
+
+Off unless VKD3D_BENCH_GPUTIME / VKD3D_BENCH_PRESENT_TIMING are set.
+---
+ libs/vkd3d/command.c       |  2 ++
+ libs/vkd3d/gputime.c       | 54 ++++++++++++++++++++++++++++++++------
+ libs/vkd3d/swapchain.c     | 25 ++++++++++++++++++
+ libs/vkd3d/vkd3d_private.h |  1 +
+ 4 files changed, 74 insertions(+), 8 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 8204583d..38075fa6 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -25598,6 +25598,8 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
+         if (cmd_list->bench_idxc_use_count)
+             vkd3d_index_cache_check_submit(cmd_list->bench_idxc_uses, cmd_list->bench_idxc_use_count);
+     }
++    for (i = 0; i < cmd_submit_count; i++)
++        vkd3d_gputime_ecl(buffers[i].commandBuffer);
+     d3d12_command_queue_add_submission(command_queue, &sub);
+ }
+ 
+diff --git a/libs/vkd3d/gputime.c b/libs/vkd3d/gputime.c
+index 93bf18d7..4942a8b7 100644
+--- a/libs/vkd3d/gputime.c
++++ b/libs/vkd3d/gputime.c
+@@ -16,8 +16,12 @@
+  * ts_ns is the segment's end on the GPU clock; dur_ns = end - previous timestamp in the same
+  * command buffer (for the first segment, end - start of the command buffer). kind is the mark that
+  * ends the segment: b(arrier) r(ender pass begins) e(nd of render pass) z (end of command buffer).
+- * Command buffers also get a "GS frame queue seq start_ns submit_cpu_ms" line (CPU time of the
+- * vkQueueSubmit2, ms since the Unix epoch like the GPU timer), presents a "GP frame cpu_ns" line.
++ * Command buffers also get a "GS frame queue seq start_ns submit_cpu_ms ecl_cpu_ms submit_end_cpu_ms waits signals
++ * index sem0:value sem1:value" line (waits, signals: of the VkSubmitInfo2 holding it; index: its place in that submit;
++ * the first two wait semaphores, the first signal semaphore)
++ * (CPU times, ms since the Unix epoch like the GPU timer: the vkQueueSubmit2 call, the game's
++ * ExecuteCommandLists that queued it (0 if not seen), the return of vkQueueSubmit2), presents a
++ * "GP frame cpu_ns" line.
+  * VKD3D_BENCH_GPUTIME_RUN=n samples n consecutive frames each time (default 1).
+  */
+ 
+@@ -49,7 +53,10 @@ struct gt_cmd
+     VkCommandBuffer cmd;
+     VkQueryPool pool;
+     uint32_t count;
+-    uint64_t frame, seq, submit_ns;
++    uint64_t frame, seq, submit_ns, ecl_ns, submit_end_ns;
++    uint32_t sub_waits, sub_signals, sub_index; /* of the VkSubmitInfo2 holding it; its index in it */
++    VkSemaphore wait_sem[2], signal_sem;
++    uint64_t wait_val[2], signal_val;
+     VkQueue queue;
+     bool submitted;
+     uint32_t rp_width, rp_height;
+@@ -220,6 +227,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL gt_BeginCommandBuffer(VkCommandBuffer cmd,
+     memset(&c->cur, 0, sizeof(c->cur));
+     c->count = 0;
+     c->note_count = 0;
++    c->ecl_ns = c->submit_end_ns = 0;
+     gt_mark(c, 's');
+     return vr;
+ }
+@@ -483,10 +491,15 @@ static uint64_t gt_epoch_ns(void)
+ 
+ static VKAPI_ATTR VkResult VKAPI_CALL gt_QueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2 *submits, VkFence fence)
+ {
+-    uint64_t now = gt_epoch_ns();
++    uint64_t now = gt_epoch_ns(), end;
+     struct gt_cmd *c;
+-    uint32_t i, j;
++    VkResult vr;
++    uint32_t i, j, k;
+ 
++    /* The command buffers stay in the table until the bookkeeping below (they cannot complete and be
++     * reused before vkQueueSubmit2 returns to the one thread submitting on this queue). */
++    vr = gt_orig.vkQueueSubmit2(queue, count, submits, fence);
++    end = gt_epoch_ns();
+     if (__atomic_load_n(&gt_tracked, __ATOMIC_RELAXED))
+     {
+         pthread_mutex_lock(&gt_lock);
+@@ -500,6 +513,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL gt_QueueSubmit2(VkQueue queue, uint32_t co
+                 c->queue = queue;
+                 c->seq = ++gt_seq;
+                 c->submit_ns = now;
++                c->submit_end_ns = end;
++                c->sub_waits = submits[i].waitSemaphoreInfoCount;
++                c->sub_signals = submits[i].signalSemaphoreInfoCount;
++                c->sub_index = j;
++                c->wait_sem[0] = c->wait_sem[1] = VK_NULL_HANDLE;
++                c->wait_val[0] = c->wait_val[1] = 0;
++                c->signal_sem = submits[i].signalSemaphoreInfoCount ? submits[i].pSignalSemaphoreInfos[0].semaphore : VK_NULL_HANDLE;
++                c->signal_val = submits[i].signalSemaphoreInfoCount ? submits[i].pSignalSemaphoreInfos[0].value : 0;
++                for (k = 0; k < submits[i].waitSemaphoreInfoCount && k < 2; k++)
++                {
++                    c->wait_sem[k] = submits[i].pWaitSemaphoreInfos[k].semaphore;
++                    c->wait_val[k] = submits[i].pWaitSemaphoreInfos[k].value;
++                }
+                 c->submitted = true;
+                 c->next = gt_pending;
+                 gt_pending = c;
+@@ -507,7 +533,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL gt_QueueSubmit2(VkQueue queue, uint32_t co
+         }
+         pthread_mutex_unlock(&gt_lock);
+     }
+-    return gt_orig.vkQueueSubmit2(queue, count, submits, fence);
++    return vr;
++}
++
++/* From ExecuteCommandLists, for each command buffer it queues: when the game handed it over. */
++void vkd3d_gputime_ecl(VkCommandBuffer cmd)
++{
++    struct gt_cmd *c;
++
++    if ((c = gt_lookup(cmd)))
++        c->ecl_ns = gt_epoch_ns();
+ }
+ 
+ void vkd3d_gputime_install(struct d3d12_device *device)
+@@ -613,8 +648,11 @@ void vkd3d_gputime_present(void)
+         *p = c->next;
+         if (vr == VK_SUCCESS && c->count)
+         {
+-            fprintf(gt_file, "GS\t%"PRIu64"\t%p\t%"PRIu64"\t%"PRIu64"\t%.3f\n", c->frame, (void *)c->queue, c->seq,
+-                    (uint64_t)(ts[0] * gt_period), c->submit_ns / 1e6);
++            fprintf(gt_file, "GS\t%"PRIu64"\t%p\t%"PRIu64"\t%"PRIu64"\t%.3f\t%.3f\t%.3f\t%u\t%u\t%u\t%"PRIx64":%"PRIu64"\t%"PRIx64":%"PRIu64"\t%"PRIx64":%"PRIu64"\n",
++                    c->frame, (void *)c->queue, c->seq, (uint64_t)(ts[0] * gt_period), c->submit_ns / 1e6, c->ecl_ns / 1e6,
++                    c->submit_end_ns / 1e6, c->sub_waits, c->sub_signals, c->sub_index,
++                    (uint64_t)c->wait_sem[0], c->wait_val[0], (uint64_t)c->wait_sem[1], c->wait_val[1],
++                    (uint64_t)c->signal_sem, c->signal_val);
+             prev = ts[0];
+             for (i = 1; i < c->count; i++)
+             {
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 187572c0..ad3b670b 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -2969,8 +2969,21 @@ static bool dxgi_vk_swap_chain_setup_present_timing_request(
+     return use_present_timing_target;
+ }
+ 
++/* miles-bench diagnostic (VKD3D_BENCH_PRESENT_TIMING=1): where the present task's time goes on the queue thread,
++ * one frame-trace line per present: "present acquire_us blit_us present_us mode". */
++static bool vkd3d_bench_present_timing(void)
++{
++    static int enabled = -1;
++    char env[8];
++
++    if (enabled < 0)
++        enabled = vkd3d_get_env_var("VKD3D_BENCH_PRESENT_TIMING", env, sizeof(env)) && env[0] == '1';
++    return enabled;
++}
++
+ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chain, uint64_t present_count, unsigned int retry_counter)
+ {
++    uint64_t bench_t0 = 0, bench_t1 = 0, bench_t2 = 0;
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+     VkSwapchainPresentFenceInfoKHR present_fence_info;
+     VkSwapchainPresentModeInfoKHR present_mode_info;
+@@ -2992,7 +3005,11 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+     if (!chain->present.vk_swapchain)
+         return;
+ 
++    if (vkd3d_bench_present_timing())
++        bench_t0 = vkd3d_get_current_time_ns();
+     vr = dxgi_vk_swap_chain_try_acquire_next_image(chain);
++    if (bench_t0)
++        bench_t1 = vkd3d_get_current_time_ns();
+     VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(chain->queue->device, vr == VK_ERROR_DEVICE_LOST);
+ 
+     /* Handle any errors and retry as needed. If we cannot make meaningful forward progress, just give up and retry later. */
+@@ -3020,6 +3037,8 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+ 
+     if (!dxgi_vk_swap_chain_submit_blit(chain, swapchain_index))
+         return;
++    if (bench_t0)
++        bench_t2 = vkd3d_get_current_time_ns();
+ 
+     memset(&present_info, 0, sizeof(present_info));
+     present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+@@ -3117,6 +3136,12 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+     vr = VK_CALL(vkQueuePresentKHR(vk_queue, &present_info));
+     VKD3D_REGION_END(queue_present);
+     vkd3d_queue_release(chain->queue->vkd3d_queue);
++    if (bench_t0)
++    {
++        uint64_t bench_t3 = vkd3d_get_current_time_ns();
++        vkd3d_frametrace_event("present %.1f %.1f %.1f mode %d", (bench_t1 - bench_t0) / 1e3, (bench_t2 - bench_t1) / 1e3,
++                (bench_t3 - bench_t2) / 1e3, (int)chain->present.selected_present_mode);
++    }
+ 
+     if (chain->queue->device->vk_info.NV_low_latency2 && chain->request.low_latency_frame_id)
+     {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 9ddc3bc5..81be9bc2 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -7458,6 +7458,7 @@ void vkd3d_frametrace_viewport(float width, float height);
+ void vkd3d_gputime_install(struct d3d12_device *device);
+ void vkd3d_gputime_present(void);
+ void vkd3d_gputime_note(VkCommandBuffer cmd, const char *fmt, ...);
++void vkd3d_gputime_ecl(VkCommandBuffer cmd);
+ bool vkd3d_gputime_tracking(VkCommandBuffer cmd);
+ void vkd3d_gputime_note_stack(VkCommandBuffer cmd, const char *what);
+ void vkd3d_gputime_dispatch_label(VkCommandBuffer cmd, uint64_t shader_hash, uint32_t x, uint32_t y, uint32_t z);

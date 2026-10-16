@@ -771,7 +771,8 @@ other screens (sysfs, root helper), and freezes + swaps out every other app unit
   MiB the desktop frees goes straight into the game's DXGI budget.
 - Series gm1 (`bench/gmseries.sh`, run as its own app unit; game ON SCREEN both arms, S12 frozen
   DLLs, warm-up W0 then AB/BA/AB; A = gaming mode paused, B = on): `bench/gmsum.py gm1`.
-  fps 44.35 -> 45.37 (+2.3%, every B above every A, closest pair 0.08 apart); game Video Budget
+  fps 44.35 -> 45.37 (+2.3%, every B above every A, closest pair 0.08 apart; to the 3rd autosave request as
+  in the step bench: 44.35 -> 45.68, +3.0%, see Dashboard audit); game Video Budget
   2245 -> 2752 MB (+506), Video Usage 2324 -> 2785; pinned sysmem ~2130 -> ~1680 MiB; swap-ins
   22.4K -> 6.0K per run (~78/s -> ~21/s); game major faults -31%; frames > 100 ms 10.3 -> 7.3.
   Direct scanout active in both arms during the fight (Hyprland never composites the game).
@@ -984,7 +985,7 @@ thread at most every 10 s. Config bench/configs/s13-learned.env; S12 A/B arm ben
   - Per-list cost: one record per (list, heap) with the first and last resource and a "mixed" flag
     replaces the scan of the list's events; a use repeating the list's last use of the heap by the
     same resource is not stored.
-  - DISCARD_KEEP (S11) skipped the UNDEFINED barrier of every discarded render target, placed ones
+  - DISCARD_KEEP (part of S5) skipped the UNDEFINED barrier of every discarded render target, placed ones
     included, and a discard is how D3D12 activates a placed target after an alias, so that skip was
     only safe by luck. Now it applies to committed targets as before, and to placed ones only when
     clear keep proves the target owns and initialized the memory (a discard is then a kept clear;
@@ -1033,3 +1034,209 @@ thread at most every 10 s. Config bench/configs/s13-learned.env; S12 A/B arm ben
   from); binaries build/checkpoint-s15/bin (SHA256SUMS; d3d12core b28f5086..., d3d12 5a9cc229...,
   unchanged), read-only learned copy = S14's; config bench/configs/s15-frozen.env. bench/play.sh
   plays S15 (VKD3D_BENCH_CLEAR_KEEP=1). Back to S14: PLAY_DLLS=build/checkpoint-s14/bin.
+- v19 confirmation (frozen S14 vs frozen S15, order BAAB x2, the reverse of v18): A 42.52 / 43.97 /
+  44.24 / 40.46 = 42.79, B 44.96 / 44.44 / 43.11 / 45.73 = 44.56 fps (+4.1%); p95 30.7 -> 29.4, p99
+  36.9 -> 34.9 ms, over 40 ms 48.5 -> 45.5, over 100 ms 7.25 -> 6.25, worst 122 -> 116 ms; 0 light-grid
+  losses, 0 failed clear-keep checks (~91% kept). Failed VRAM allocations A 0/10/16/19, B 0/0/50/0:
+  they come with a game state, not a build. Some launches load with ~32 MiB more of the game's own
+  VRAM (nvidia-smi, 2403-2412 vs 2371-2386 MiB, from before the fight starts), in both arms (v18 B6,
+  B7; v19 A2, A3, A6, A7, B5); every failure burst is in such a launch. The first budget the game is
+  given (2563-2575 MiB) does not predict it. That state also costs fps (S14 42.8 vs 43.3, S15 43.6 vs
+  44.9), and v19 drew it for all four S14 launches, so v19's +4.1% overstates; v18 + v19 together:
+  S14 43.05, S15 44.40 fps (+3.1%).
+- Index cache, verify at submission (VKD3D_BENCH_INDEX_CACHE_VERIFY=1, s15 + verify): the page-level
+  check from round 1 flagged, over one fight (16.1M cached draws), 3 draws whose source pages were
+  written between recording and submission and 10,470 whose run "was evicted". Both are page-level
+  upper bounds: the table entry is re-pointed when a later draw needs a longer run from the same page
+  (the old run stays intact and drawable), and a write anywhere in a 4 KiB page bumps its generation.
+  The check now compares, at submission, the exact bytes each cached draw will read (cached copy vs
+  source; copies at least two presents old) and counts reused cache pages separately (fork, after
+  checkpoint-s15; verify-only code, play builds unchanged). v19-verify3: 5,222,164 cached draws
+  checked, 4,945,315 compared byte for byte, 0 differ, 0 reused, 0 late (page level: 5,217
+  re-pointed, 3 pages written since). The verify build reads the write-combined source on the CPU,
+  so it ran at 4 fps; a diagnostic, not a measurement.
+
+## S16 (2026-10-15): render-thread CPU cuts (checkpoint-s16)
+
+Goal: 52 fps in the fight (S15: ~44-45). Where the S15 frame goes (fight, ~45 fps,
+~21.8 ms/frame; one-off scripts):
+- GPU (v20-S15-gt): queue 0 compute 9.65 ms, render 9.61, barrier-only 1.10, copies 0.63: ~21 ms of
+  GPU work per frame. Heaviest shaders 7377a06a 1.72 ms, 53df85 1.32, c9d908 1.14, 13005b60 1.00,
+  b9458a24 0.68, b24add 0.55, 3990525 0.33; their SPIR-V (analysis/shaders) is clean
+  (OpRawAccessChainNV, almost no NoContraction): no lossless codegen lever there. The ~21 full
+  ALL_COMMANDS barriers per frame are the particle-batch phase barriers (their time is particle work
+  in secondaries); the depth layout changes (~0.2 ms) are inherent; the present blit is 0.08 ms.
+- Clocks (v20-S15-clk, nvidia-smi 1 Hz): 1911 MHz core / 4006 MHz memory throughout, P0, PCIe gen3 x16,
+  77 W of a 120 W limit, 77 C, no throttle reason in any sample. No clock lever.
+- No VK_EXT_descriptor_heap / mutable descriptors on this driver, and the game's root signatures use
+  multi-descriptor volatile CBV tables, so CBVs cannot be hoisted into root descriptors.
+- DRAM (v20-S15-mem, uncore IMC counters): 7.3-7.9 GiB/s of the single channel's 11.9 GiB/s; CPU
+  cores 5.6-5.8, GPU over PCIe 1.6-2.3. 91% of the CPU's L3-miss traffic is the game process, 75% in
+  MilesMorales.exe itself, spread over many functions (top one 3.2%); vkd3d (d3d12core) 4%.
+- GPU idle: nvidia-smi utilization ~92% (~1.7 ms/frame idle), from late submissions by the render
+  thread (~90 us per command buffer from record to submit); waits on other queues are 0.04 ms.
+- CPU (v20-S15-cpu, per-thread CPU time): Render Thread 18.88 ms/frame (2.1 ms of it the game's own
+  pause spin), main thread 18.36, job threads 6-9 each. Render thread by module: game 48.6%,
+  d3d12core 17%, NVIDIA driver 16%, ntdll 5.5%, msvcrt 5.1%.
+- Render-thread call stacks (perf LBR, v21-dev-lbr): d3d12_fence_GetCompletedValue 5.0% (the fence
+  mutex, contended with the fence worker: SRW acquire + wake), the global atomic in
+  vkd3d_frametrace_count_draw ~4%, vkd3d_index_cache_lookup's lock ~3.1%, one
+  vkCmdBindIndexBuffer2KHR per cached indexed draw, clear keep's ck_use lock.
+  d3d12_desc_copy_range is 6.4% inclusive, 4.7% of it memmove: the descriptor payload copies
+  (~2 MB/frame of real data movement), left alone. begin_render_pass 8.7%, mostly NVIDIA driver time.
+- Changes (fork, all lossless: identical GPU work and D3D12-visible behaviour):
+  1. Frame trace: draws are counted per command list (list->bench_draws, reset with the list) and
+     added to the frame's count in ExecuteCommandLists, instead of a global atomic per draw from
+     every recording thread. Diagnostic only; run.sh/play.sh sessions always have the trace on.
+  2. Index cache: the cache buffer is bound whole once (offset 0, VK_WHOLE_SIZE) and each cached draw
+     passes firstIndex = cache offset / index size (the old per-draw bind when the offset is not
+     index-aligned or does not fit 32 bits). A shadow (list->bench_idxc_bound, type, command buffer)
+     is cleared wherever the index binding can change: list reset, invalidate_all_state,
+     IASetIndexBuffer, ExecuteIndirect index-buffer tokens, and update_index_buffer's bind of the
+     game's buffer; index_buffer.is_dirty stays set after a cached draw, so the next uncached draw
+     rebinds the game's buffer as before.
+  3. Clear keep: ck_use checks the list's own (list, heap) records before taking vkd3d_ck_lock and
+     returns when the use repeats the record's last resource (ck_add_event would store nothing).
+  4. Fences: GetCompletedValue reads virtual_value with an acquire load and no mutex; the two runtime
+     stores (CPU signal, the worker's signal loop) are release stores, still under the mutex.
+  5. Index cache: idxc_lock is a reader/writer lock; a hit on a fresh run is served under the shared
+     lock (table, generations and runs only change under the exclusive lock; the hit writes only the
+     run's last-drawn present, atomically, and the hit count). Misses, stale runs and verify mode
+     take the exclusive lock and the unchanged full path.
+- v21-dev (changes 1-3): Render Thread 18.18 ms/frame (-0.7 ms vs S15).
+- Review (all five changes): no lossless defect. One real race in 5: two shared-lock hits could
+  store their present counts out of order, so a run's last-drawn present could go back by one
+  (eviction margin 7 presents instead of 8). Fixed: the store is a CAS max (and is skipped when the
+  value is already current). Also checked by the reviewer: every Vulkan index bind and every
+  command-buffer switch clears or re-keys the shadow; VK_WHOLE_SIZE with offset 0 is valid and every
+  index read stays in range; no fence reader relied on the mutex for ordering (a poller may now see
+  an intermediate value of a multi-signal batch, each a completed GPU-order signal: valid D3D12).
+  Not changed: the hit counter stays one relaxed atomic per cached draw.
+- v21 fight A/B (S15 frozen vs changes 1-5 before the review fix, build/s16-staged; ABBA x2, 3rd
+  autosave): A 43.67 / 43.71 / 43.75 / 44.00 = 43.78, B 43.64 / 44.25 / 44.05 / 43.87 = 43.95 fps
+  (+0.4%); p95 30.30 -> 30.08, p99 37.1 -> 36.0 ms, over 40 ms 52 -> 48 per run, over 100 ms 7 -> 7,
+  worst 121 vs 122 ms; 0 light-grid losses. All four B launches drew the game's +32 MiB VRAM state
+  (game total ~2925 vs ~2893 MiB; other processes 501-521 MiB in every run), one A launch did (A5):
+  failed 6 MiB allocations A 8/2/12/0, B 2/24/16/24, fallen back to system memory as before (demoted
+  912-920 MiB in both). That state costs fps (v19), so B's lead is despite it.
+- v22 fight A/B (S15 frozen vs the final build with the review fix, build/s16b-staged; order BAAB
+  x2, the reverse of v21): A 44.16 / 41.11 / 43.53 / 44.08 = 43.22, B 44.58 / 43.44 / 43.60 / 44.93 =
+  44.14 fps (+2.1%); p95 30.60 -> 30.14, p99 36.40 -> 36.23 ms, over 40 ms 51 -> 52, over 100 ms
+  7.25 -> 7.0; 0 light-grid losses. The +32 MiB state: A 3 of 4 launches (A3, A6, A7), B 2 of 4 (B4,
+  B5), so v21's 4 of 4 was the draw (S15 over v18-v22: 10 of 24 launches; S16 6 of 8; p ~0.1).
+- v21 + v22 (16 launches): S15 43.50, S16 44.05 fps (+1.25%; +1.22% with every launch cut at the 3rd
+  autosave request, see Dashboard audit); within the same VRAM state +1.6% (high:
+  43.12 vs 43.81) and +2.0% (low: 43.89 vs 44.76). p95 30.45 -> 30.11, p99 36.75 -> 36.10 ms. Spike
+  frames pooled over all 16 launches: over 60 ms 15.5 vs 16.0 per launch, over 100 ms 7.1 vs 7.0,
+  their median 111.7 vs 111.8 ms (the same autosave / phase-change frames in every launch).
+- Not the 52 fps asked for: the fight is GPU-bound (~21 ms of GPU work per ~22 ms frame), and the
+  CPU cuts only remove render-thread time where it delays a submission.
+- Checkpoint: fork commit 9369c583, tag checkpoint-s16 (diff vs checkpoint-s15 =
+  patches/vkd3d-proton-checkpoint-s16.patch, includes the verify-only commit 51ccb440); binaries
+  build/checkpoint-s16/bin = the v22 B build (SHA256SUMS; d3d12core 88676f50..., d3d12 5a9cc229...,
+  unchanged), read-only learned copy = S15's (58ee4aeb...); config bench/configs/s16-frozen.env.
+  bench/play.sh plays S16. Back to S15: PLAY_DLLS=build/checkpoint-s15/bin.
+
+## S16 follow-up (2026-10-15): where the GPU's idle time goes (no lever on vkd3d's side)
+
+- Question: the fight is GPU-bound but the direct queue still idles between command buffers (gputime:
+  2.9-4.8 ms per sampled frame; nvidia-smi ~92% busy, ~1.7 ms/frame). How much of that is vkd3d's?
+- Diagnostics added (fork 058a0850, off unless enabled): gputime's GS lines carry the
+  ExecuteCommandLists time, the return of vkQueueSubmit2 and the submit's semaphores
+  (bench/gpugaps.py splits each gap: game late / vkd3d queue thread / submitted but not started);
+  VKD3D_BENCH_PRESENT_TIMING=1 times the present task. Configs bench/configs/diag-*.env.
+- v23-S16-gt (S16 + diagnostics): idle 4.06 ms/frame = game late 2.27, queue thread 0.54, submitted
+  but not started 1.25 (an upper bound: it includes the 70-150 us an idle GPU takes to start a new
+  submission, and gaps filled by command buffers recorded before the sampled frame, which gputime
+  does not track). Most game-late idle sits mid-frame (before the 5th command buffer: 0.7-3.3 ms
+  waits for the render thread), not at the frame start.
+- vkd3d chains every submission on a D3D12 queue with a binary "serializing" semaphore on NVIDIA
+  (upstream 53288f6f; other drivers get a reusable full-barrier command buffer). Probe
+  (VKD3D_BENCH_SUBMIT_BARRIER, v23-sb-gt, removed): measured only where the next command buffer was
+  already queued, a boundary costs 12.5 us (median) with the semaphore and 13.2 us with the barrier
+  command buffer. Not a lever.
+- vkd3d queue trace (VKD3D_QUEUE_PROFILE, v23-qp): the direct queue's submission thread spends per
+  frame 1.22 ms presenting (the swapchain present runs on it), 0.85 ms submitting, 0.58 ms in queue
+  waits, 0.55 ms waiting for signals not yet submitted (median 0.5 us, up to 13.6 ms). Against the
+  submission timeline, only ~0.15 ms/frame of GPU idle overlaps that thread's work (0.002 ms the
+  present); the rest is the game submitting late.
+- Present (v23-pt): the game runs VSync on at 60 Hz (its log), so vkd3d presents FIFO (mode 2):
+  acquire 39 us, blit submit 59 us, vkQueuePresentKHR 761 us median (p90 3.6 ms) on the queue thread,
+  while the GPU is still busy with earlier work.
+- Conclusion: the idle is the game's render thread (S16 already took vkd3d's own locking off it);
+  what is left on vkd3d's side is ~0.15 ms/frame. (Overstated, see Dashboard audit: the 0.54 ms
+  between ExecuteCommandLists and vkQueueSubmit2 is only ~0.15 ms the queue thread working; the rest is
+  unexplained, and the 1.25 ms submitted-not-started is neither thread.) Toward 52 fps the remaining cost is GPU work
+  (~21 ms/frame), which earlier analysis found no lossless lever for (S16 section).
+
+## Dashboard audit (2026-10-15): like-for-like checks
+
+Started from the question why frames over 100 ms rose from 5.0 (S8) to 7.0 (S16).
+- Window: v10-v13 HDD launches were read with bench/fightwin.py (fight start to the 3rd autosave
+  request); fight.json from v13 on (fightrun polls game.log once a second) ran 0.36-1.0 s past the
+  request and caught 1-2 frames of that autosave's own stall (104-127 ms). Every launch now via
+  `bench/fightwin.py 3` (captures/<run>/fightwin3.json). Frames over 100 ms: S8 5.0, S9 5.7, S12 5.0,
+  S13-S15 5.3, S16 5.5; from S8 on 5.3 per fight, 3.6 of them between 1 s before and 4 s after the
+  1st/2nd autosave request, the same on the HDD (S8-S9) and the SSD (S12-S16). No regression.
+  Same-series fps: S16 vs S15 +1.22% (v21, v22), S15 vs S14 +3.12% (v18, v19), S14 +0.48%, S13 +0.23%.
+- Gaming mode (gm1/gm2) used fight.json's longer window (259-333 s, past the 3rd autosave). To the
+  3rd request: gm1 44.35 -> 45.68 fps (+3.0%, every B above every A still), over 100 ms 6.0 -> 3.7;
+  gm2 B 45.15, C 45.49 (+0.8%). Swap-ins stay whole-run (the counter is read only at start and end).
+- On screen vs the step bench: the same S12 build within hours ran 44.35 fps in gm1's normal-desktop
+  arm (game on screen, direct scanout, warm-up launch first) and 42.49 in v13/v15 (hidden, the
+  desktop composited): +4.4%. Cause not isolated. The 2026-10-12 check that hidden rendering is
+  neutral was one 12 s peek at ~34 fps; it does not settle this. A/B pairs are unaffected (both arms
+  hidden), absolute fps are the bench's own.
+- Desktop VRAM (total - game, samples.tsv): ~630-660 MiB in v10-v15 and gm1-A, ~520 in v16-v19,
+  ~500-527 in v21/v22 (cause not recorded). Same S13 build, v15 -> v16: desktop -136 MiB, game
+  budget 2264 -> 2396 MiB, usage +140, pinned 2092 -> 1959 MiB. So the dashboard's "budget ~100 MiB
+  higher since S13" and the pinned fall after S13 were the desktop; within series S13-S16 moved
+  pinned by 15 MiB or less. Headline S0 (v13, desktop 638) vs S16 (507): ~134 of the -675 MiB pinned
+  is the desktop, and up to ~0.8% fps (gm1's gain per MiB of budget, an upper bound).
+- Major faults: HDD launches 37-531 thousand per fight vs 7-20 thousand on the SSD (HDD sessions
+  also had ~1.6-1.9 GB in zram, game RSS ~2.4 vs ~3.0 GB). The headline uses SSD launches only, now
+  per minute (windows run 131-272 s): 5.7 -> 2.9 thousand (-49%).
+- GPU idle: the v23 split (game late 2.27, hand-over to vkQueueSubmit2 0.54, submitted not started
+  <= 1.25 ms per traced frame) is from frames with timestamps on (4.06 ms idle vs ~1.6 untraced by
+  nvidia-smi): shares, not time to win. Of the 0.54 ms the queue thread is busy ~0.15; what holds the
+  rest is open (waits the game requested, or the thread's wake-up, are candidates). Render thread at
+  S15: game 48.6%, d3d12core 17%, NVIDIA 16%, so "game late" is not all game code.
+- Switching: the TV-off worst frame 227 ms was with the bar running; gaming mode stops the bar first
+  (97 ms in the one such test).
+
+## Repository (2026-10-15): layout, the fork as a patch series, authorship
+
+- On GitHub; the layout is in README.md. `patches/` holds the fork as a per-commit series on
+  upstream and replaced the per-checkpoint diffs, which stay in this repository's checkpoint
+  commits; `tools/fork.sh` rebuilds the fork from upstream and checks every hash. `analysis/`
+  (decompilations and shader dumps from the game) was taken out of the whole history before
+  publishing and stays local.
+- The `checkpoint-s16` release (2026-10-16) carries DLLs built from the committed checkpoint-s16 by
+  README's Building steps (d3d12core 45b1ec67..., d3d12 5a9cc229...): builds from fresh clones of
+  the repository, on different days and paths, were byte-identical. The measured binaries in
+  build/checkpoint-s16/bin (d3d12core 88676f50..., build id 51ccb440...+) differ from them only in
+  the build id; play.sh keeps using those. The tag now marks the repository with S16 current, so the
+  release's source archive has README and the patch series.
+- `learned/` is no longer tracked: every machine writes its own. The copy S13-S16 were measured with
+  (58ee4aeb...) is in the S13 checkpoint commit and in build/checkpoint-s1*/learned.
+- Every commit in the fork was re-created on 2026-10-15 with the author and committer
+  `Zaid <nottzaid@tutamail.com>`; its trees and dates are unchanged (backups:
+  build/backup-pre-trailer-2026-10-15/, build/backup-pre-public-2026-10-15/). Fork hashes cited
+  earlier in these notes map to:
+
+  | Fork commit | Before | Now |
+  |---|---|---|
+  | S12 | 892135ac | 0c669bcb |
+  | S13 | 50382a55 | 1fdba59f |
+  | S14 | 375c0f99 | e34af541 |
+  | S15 | 012433f4 | e8c7c69f |
+  | idxcache verify | 51ccb440 | 565fe641 |
+  | S16 | 9369c583 | aaf4215c |
+  | diagnostics | 058a0850 | 4820c6f7 |
+  | dxil-spirv (S12) | c015cfc3 | 6d25da1b |
+
+  Each checkpoint DLL in build/checkpoint-s1* was built from the working tree just before its
+  checkpoint was committed, so it reports the commit before (old hash; S12's the upstream base) as
+  vkd3d's build id (vkd3d_build, which keys its pipeline cache). A rebuild from a checkpoint commit
+  gets that commit's new hash as its id, so vkd3d's pipeline cache starts over once.
+

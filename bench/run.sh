@@ -64,6 +64,7 @@ export VKD3D_LOG_FILE=$(winpath "$cap/vkd3d.log")
 # Sizes the bench features learned in earlier sessions (learned.c): one file for every run and play
 # session, whatever directory the game starts in.
 export VKD3D_BENCH_LEARNED_PATH=${VKD3D_BENCH_LEARNED_PATH:-$bench/learned}
+mkdir -p "$VKD3D_BENCH_LEARNED_PATH"
 
 "$bench/bench/sample.sh" "$cap/samples.tsv" &
 sampler_pid=$!

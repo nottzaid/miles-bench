@@ -1,0 +1,12 @@
+step,order,name,what_changed,kind
+S0,0,Unpatched,"vkd3d-proton as GE-Proton ships it, no changes",baseline
+S5,1,Steps 1-5,VRAM reserve for render targets; geometry decompression fix; index cache; particle batching; discard barriers; particle draw constants; lazy descriptor heaps,speed and memory
+S6,2,Page drops,"Drops destination pages the engine overwrites anyway, so they are never swapped back in",memory
+S7,3,Sparse light grid,The 512 MiB light grid is backed only where the engine uses it,memory
+S8,4,Index cache fix,A full index cache no longer re-scans its whole ring on every draw,speed
+S9,5,Sparse skinning buffer,The 196 MiB skinning buffer is backed only where the engine uses it,memory
+S12,6,Lighting fix + SSD,Light grid and skinning backed further up front (no missing lighting); game moved to the SSD so the driver's shader cache works,correctness and smoothness
+S13,7,Learned sizes + gates,"Light grid, skinning buffer, VRAM reserve and budget hold sized from what earlier sessions of this game build actually used, instead of constants tuned on this PC; each feature checks it can help (known game build, a separate GPU, sparse memory support) before changing anything",portability and memory
+S14,8,Index cache eviction fix,"The index cache freed only the first page of each run it evicted, so it refused runs it had room for; now it frees the whole run (refusals 2153/s -> 304/s)",speed
+S15,9,Clear keep,"A full clear of a render target that sits in memory shared with others no longer throws its layout away when vkd3d can prove, in GPU order, that no other resource used that memory since the target last initialized it (about 18 clears per frame); also review fixes to the learned sizes, the integrated-GPU gates and the light grid and skinning growth",speed and correctness
+S16,10,Render-thread CPU cuts,"Less locking and fewer driver calls on the game's render thread: draw counts kept per command list, the index cache bound once per command buffer, lock-free fence polling, index cache hits under a shared lock, and a lock-free repeat check in clear keep; nothing the GPU draws changes",speed

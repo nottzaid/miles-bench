@@ -1,12 +1,21 @@
+# The fork: tools/fork.sh rebuilds it from upstream and patches/
 src/
+# Build output: DLLs, the checkpoint binaries, backups, run logs
 build/
+# Raw recordings of every launch (~11 GB); data/ holds the tables built from them
 captures/
-ghidra/
-*.log
+# The bench's Wine prefix: a copy of the game's, with the player's profile in it
 prefix/
+# Decompilations and shader dumps of the game: its publisher's code
+analysis/
+# Sizes the features learned on this machine: every machine writes its own
+learned/
+# Ghidra's download and install, and its project of the game's executable (the game's code again)
 tools/dl-ghidra/
 tools/dl-ghidramcp/
 tools/ghidra_12.1.4_PUBLIC/
 tools/ghidra-proj/
+# Logs, vkd3d's pipeline cache, Python bytecode
+*.log
 vkd3d-proton.cache
 __pycache__/

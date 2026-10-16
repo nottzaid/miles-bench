@@ -1,0 +1,13 @@
+series,run,launch_order,arm
+gm1,gm1-A1,1,Normal desktop
+gm1,gm1-B1,2,Gaming mode
+gm1,gm1-B2,3,Gaming mode
+gm1,gm1-A2,4,Normal desktop
+gm1,gm1-A3,5,Normal desktop
+gm1,gm1-B3,6,Gaming mode
+gm2,gm2-B1,1,Gaming mode
+gm2,gm2-C1,2,Gaming mode from launch
+gm2,gm2-C2,3,Gaming mode from launch
+gm2,gm2-B2,4,Gaming mode
+gm2,gm2-B3,5,Gaming mode
+gm2,gm2-C3,6,Gaming mode from launch

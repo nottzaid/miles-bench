@@ -1,3 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zaid <nottzaid@tutamail.com>
+Date: Thu, 15 Oct 2026 09:12:45 +0300
+Subject: [PATCH 4/7] miles-bench S15: clear keep, review fixes
+
+Clear keep (VKD3D_BENCH_CLEAR_KEEP=1, engine feature bit 0x1000): a full clear or discard of a
+placed render target keeps its layout instead of transitioning from UNDEFINED when a replay of
+every use of its heap in submission order proves the target owns and initialized the memory.
+Heaps qualify only while they hold plain single-subresource RT/DS textures, are not shared or
+tile-mapped, and are used from direct lists on one queue; a failed replay check turns the
+feature off for the session. DISCARD_KEEP now skips the UNDEFINED barrier of placed targets only
+when clear keep proves them.
+
+Review fixes (three rounds): learned sizes (CAS raise, bounds, DLL pin, GPU
+identity, no writes when forced), integrated-GPU gates, light grid / skinning growth wanted
+size and hold, lazy backing only with a learned reserve, index cache verify mode checks at
+submission.
+---
+ libs/vkd3d/command.c       | 411 ++++++++++++++++++++++++++++++++++++-
+ libs/vkd3d/device.c        |  15 ++
+ libs/vkd3d/enginepatch.c   |   3 +
+ libs/vkd3d/heap.c          |   2 +
+ libs/vkd3d/idxcache.c      |  67 +++++-
+ libs/vkd3d/learned.c       |  95 ++++++++-
+ libs/vkd3d/lightgrid.c     |  30 ++-
+ libs/vkd3d/memtrace.c      |  20 ++
+ libs/vkd3d/resource.c      |   1 +
+ libs/vkd3d/skinbuf.c       |  30 ++-
+ libs/vkd3d/vkd3d_private.h |  32 ++-
+ 11 files changed, 675 insertions(+), 31 deletions(-)
+
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
 index 2991a31d..fbdd33b6 100644
 --- a/libs/vkd3d/command.c

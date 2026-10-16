@@ -1,0 +1,8 @@
+run,setup,cache_drive,compile_seconds,compiles_over_100ms,longest_compile_ms,frames_over_300ms,submissions_missing_lighting,submissions_missing_skinning
+psoA-S9,Game and shader cache on the HDD (as before),HDD,23.6,83,447,4,10101,0
+psoB-S9,Game and shader cache on the HDD (as before),HDD,40.8,142,730,5,30401,0
+psoP,Cache copied to the HDD under a plain folder name,HDD,85.0,220,1444,0,15001,0
+psoQ,Cache copied to the SSD,SSD,1.5,2,287,0,8101,0
+ssd1-S9,Game moved to the SSD,SSD,5.1,1,558,0,30701,0
+ssd2-S9,Game moved to the SSD,SSD,10.7,16,437,0,31901,0
+ssd3-S9,"Game on the SSD, lighting fix",SSD,11.0,8,274,1,0,0

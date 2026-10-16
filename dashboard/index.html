@@ -1,0 +1,810 @@
+<style>
+.mm { display: flex; flex-direction: column; gap: var(--cds-gap-xl); font-family: var(--font-anthropic-sans); max-width: 78rem; margin-inline: auto; }
+.mm h1 { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); margin: 0; text-wrap: balance; }
+.mm h2 { font-size: var(--cds-font-size-heading); font-weight: var(--cds-font-weight-medium); margin: 0; text-wrap: balance; }
+.mm h3 { font-size: var(--cds-font-size-body); font-weight: var(--cds-font-weight-medium); margin: 0; }
+.mm p { margin: 0; }
+.mm-take { font-size: var(--cds-font-size-body); margin-top: var(--cds-gap-sm); line-height: 1.5; }
+.mm-context, .mm-note { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); line-height: 1.45; }
+.mm-section { display: flex; flex-direction: column; gap: var(--cds-gap-md); }
+.mm-section > header { display: flex; flex-direction: column; gap: var(--cds-gap-xs); }
+.mm-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 11.5rem), 1fr)); gap: var(--cds-gap-md); }
+.mm-tile { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-md) var(--cds-pad-lg); display: flex; flex-direction: column; gap: var(--cds-gap-xs); min-width: 0; }
+.mm-tile-label { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+.mm-big { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); font-variant-numeric: tabular-nums; line-height: 1.15; }
+.mm-unit { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin-left: 0.25em; }
+.mm-from { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); font-variant-numeric: tabular-nums; }
+.mm-good { color: var(--color-ok); font-variant-numeric: tabular-nums; }
+.mm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 30rem), 1fr)); gap: var(--cds-gap-md); }
+.mm-card { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-lg); display: flex; flex-direction: column; gap: var(--cds-gap-sm); min-width: 0; }
+.mm-card.mm-wide { grid-column: 1 / -1; }
+.mm-chart { position: relative; min-height: 13rem; }
+.mm-chart svg { display: block; overflow: visible; }
+.mm svg text { font-family: var(--font-anthropic-sans); font-size: var(--cds-font-size-caption); fill: var(--color-fg-muted); }
+.mm svg text.mm-val { fill: var(--color-fg); font-variant-numeric: tabular-nums; }
+.mm-key { display: flex; flex-wrap: wrap; gap: var(--cds-gap-xs) var(--cds-gap-md); font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+.mm-key span { display: inline-flex; align-items: center; gap: 0.35rem; }
+.mm-dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; display: inline-block; box-sizing: border-box; }
+.mm-dot.hdd { background: var(--color-fg-muted); }
+.mm-dot.ssd { border: 1.5px solid var(--color-fg-muted); background: var(--color-bg); }
+.mm-swatch { width: 0.75rem; height: 0.75rem; border-radius: 3px; display: inline-block; }
+.mm-meanline { width: 0.9rem; height: 2px; border-radius: 1px; display: inline-block; background: var(--color-fg-muted); }
+.mm-tip { position: absolute; z-index: 2; pointer-events: none; background: var(--cds-surface-popover); border: 1px solid var(--cds-border); border-radius: var(--cds-radius); box-shadow: var(--cds-shadow-popover); padding: var(--cds-pad-xs) var(--cds-pad-sm); font-size: var(--cds-font-size-caption); max-width: 16rem; display: flex; flex-direction: column; gap: 2px; }
+.mm-tip[hidden] { display: none; }
+.mm-tip .mm-tip-head { color: var(--cds-text-secondary); }
+.mm-tip .mm-tip-row { font-variant-numeric: tabular-nums; }
+.mm-stack { display: flex; gap: 2px; height: 1.6rem; border-radius: var(--cds-radius); overflow: hidden; }
+.mm-stack > div { height: 100%; min-width: 2px; }
+.mm-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr)); gap: var(--cds-gap-xs) var(--cds-gap-md); font-size: var(--cds-font-size-caption); }
+.mm-legend > div { display: flex; align-items: center; gap: 0.45rem; min-width: 0; }
+.mm-legend .mm-num { font-variant-numeric: tabular-nums; color: var(--color-fg); white-space: nowrap; }
+.mm-hbars { display: flex; flex-direction: column; gap: var(--cds-gap-sm); }
+.mm-hbar { display: flex; flex-direction: column; gap: 4px; }
+.mm-hbar-label { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+.mm-hbar-row { display: flex; align-items: center; gap: var(--cds-gap-sm); }
+.mm-hbar-track { flex: 1; min-width: 0; }
+.mm-hbar-fill { height: 0.9rem; border-radius: 4px; }
+.mm-hbar-num { font-size: var(--cds-font-size-caption); font-variant-numeric: tabular-nums; white-space: nowrap; min-width: 6.5rem; text-align: right; }
+.mm-hbar-num b { font-weight: var(--cds-font-weight-medium); }
+.mm-hbar-rounds { color: var(--color-fg-muted); }
+.mm-tablewrap { overflow-x: auto; }
+.mm table { width: 100%; border-collapse: collapse; font-size: var(--cds-font-size-caption); font-variant-numeric: tabular-nums; }
+.mm th { text-align: left; font-weight: var(--cds-font-weight-medium); color: var(--color-fg-muted); padding: var(--cds-pad-xs) var(--cds-pad-sm); border-bottom: 1px solid var(--color-border-line); white-space: nowrap; }
+.mm td { padding: var(--cds-pad-xs) var(--cds-pad-sm); border-bottom: 1px solid var(--color-border-line); vertical-align: top; }
+.mm td.num, .mm th.num { text-align: right; }
+.mm td.muted { color: var(--color-fg-muted); white-space: nowrap; }
+.mm td.wrap { min-width: 14rem; max-width: 34rem; line-height: 1.4; }
+.mm-cellbar { display: inline-block; height: 0.5rem; border-radius: 3px; vertical-align: middle; margin-left: 0.4rem; }
+.mm-failed { display: flex; align-items: center; justify-content: center; gap: 0.4rem; min-height: inherit; color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+.mm-failed::before { content: ""; width: 0.375rem; height: 0.375rem; border-radius: 50%; background: var(--color-bad); }
+.mm-eyebrow { display: inline-flex; align-self: flex-start; align-items: center; gap: 0.45rem; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); border: 1px solid var(--color-border-line); border-radius: 999px; padding: 2px 10px; }
+.mm-eyedot { width: 0.5rem; height: 0.5rem; border-radius: 50%; display: inline-block; }
+.mm-split { display: flex; gap: 2px; height: 0.9rem; }
+.mm-split > div { height: 100%; }
+.mm-split > div:first-child { border-radius: 4px 0 0 4px; }
+.mm-split > div:last-child { border-radius: 0 4px 4px 0; }
+.mm [data-dash-source-state=empty] { color: transparent; }
+.mm [data-dash-source-state=refreshing] { opacity: .5; transition: opacity var(--cds-dur-slow); }
+</style>
+
+<div class="mm">
+  <header id="top">
+    <h1>Miles Morales optimization</h1>
+    <p class="mm-take dash-skeleton" id="takeaway">On the same GTX 1060, the current build (<span data-source="summary" data-field="step" data-where="build=Optimized">—</span>) runs the Rhino fight at
+      <b data-source="summary" data-field="fps" data-where="build=Optimized">—</b> fps against
+      <b data-source="summary" data-field="fps" data-where="build=Unpatched">—</b> unpatched, a gain of
+      <b data-source="change" data-field="fps_gain_pct" data-row="0">—</b>%. Frames slower than 40 ms fell from
+      <span data-source="summary" data-field="slow_per_min" data-where="build=Unpatched">—</span> to
+      <span data-source="summary" data-field="slow_per_min" data-where="build=Optimized">—</span> a minute, at the same graphics settings.</p>
+    <p class="mm-context">GTX 1060 3 GB, i5-4670, game and shader cache on the SSD. The fight is played by injected keys and measured from its start to the game's 3rd autosave request, with the game rendering hidden on its workspace; each figure is the mean of the launches shown. The unpatched figures come from <span data-source="summary" data-field="launches" data-where="build=Unpatched">—</span> launches in series <span data-source="summary" data-field="series" data-where="build=Unpatched">—</span>, the current build's from <span data-source="summary" data-field="launches" data-where="build=Optimized">—</span> in <span data-source="summary" data-field="series" data-where="build=Optimized">—</span>: different sessions, which on their own can move the fight's frame rate by a few percent. The desktop also held less video memory in the current build's sessions (<span data-source="summary" data-field="desktop_vram_mib" data-where="build=Optimized">—</span> against <span data-source="summary" data-field="desktop_vram_mib" data-where="build=Unpatched">—</span> MiB): on one build that alone took <span data-source="desktop_effect" data-field="same_build_pinned_drop_mib" data-row="0">—</span> MiB off pinned RAM, and scaled from the gaming-mode series it is worth up to <span data-source="desktop_effect" data-field="fps_est_pct" data-row="0">—</span>% of fps. In that series, with the game on screen and a warm-up launch first, the same S12 build ran <span data-source="s12_bench" data-field="gap_pct" data-row="0">—</span>% faster than in this bench within hours, so these fps are the bench's own, not a prediction for play.</p>
+  </header>
+
+  <section class="mm-section" id="headline">
+    <div class="mm-tiles">
+      <div class="mm-tile">
+        <span class="mm-tile-label">Frames per second</span>
+        <span><span class="mm-big" data-source="summary" data-field="fps" data-where="build=Optimized">—</span><span class="mm-unit">fps</span></span>
+        <span class="mm-from">from <span data-source="summary" data-field="fps" data-where="build=Unpatched">—</span> unpatched, <span class="mm-good">+<span data-source="change" data-field="fps_gain_pct" data-row="0">—</span>%</span></span>
+      </div>
+      <div class="mm-tile">
+        <span class="mm-tile-label">95th-percentile frame time</span>
+        <span><span class="mm-big" data-source="summary" data-field="p95_ms" data-where="build=Optimized">—</span><span class="mm-unit">ms</span></span>
+        <span class="mm-from">from <span data-source="summary" data-field="p95_ms" data-where="build=Unpatched">—</span> ms, <span class="mm-good">−<span data-source="change" data-field="p95_saved_ms" data-row="0">—</span> ms</span></span>
+      </div>
+      <div class="mm-tile">
+        <span class="mm-tile-label">Frames over 40 ms, per minute</span>
+        <span><span class="mm-big" data-source="summary" data-field="slow_per_min" data-where="build=Optimized">—</span><span class="mm-unit">a minute</span></span>
+        <span class="mm-from">from <span data-source="summary" data-field="slow_per_min" data-where="build=Unpatched">—</span>, <span class="mm-good">−<span data-source="change" data-field="slow_drop_pct" data-row="0">—</span>%</span></span>
+      </div>
+      <div class="mm-tile">
+        <span class="mm-tile-label">Driver-pinned system RAM</span>
+        <span><span class="mm-big" data-source="summary" data-field="pinned_mib" data-where="build=Optimized">—</span><span class="mm-unit">MiB</span></span>
+        <span class="mm-from">from <span data-source="summary" data-field="pinned_mib" data-where="build=Unpatched">—</span> MiB, <span class="mm-good">−<span data-source="change" data-field="pinned_saved_mib" data-row="0">—</span> MiB</span></span>
+        <span class="mm-from">about <span data-source="desktop_effect" data-field="same_build_pinned_drop_mib" data-row="0">—</span> MiB of it from a lighter desktop</span>
+      </div>
+      <div class="mm-tile">
+        <span class="mm-tile-label">Game's memory reads from swap or disk, a minute</span>
+        <span><span class="mm-big" data-source="summary" data-field="faults_k_per_min" data-where="build=Optimized">—</span><span class="mm-unit">thousand</span></span>
+        <span class="mm-from">from <span data-source="summary" data-field="faults_k_per_min" data-where="build=Unpatched">—</span> thousand, <span class="mm-good">−<span data-source="change" data-field="faults_drop_pct" data-row="0">—</span>%</span></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="mm-section" id="steps">
+    <header>
+      <h2>Step by step: the Rhino fight</h2>
+      <p class="mm-note">Each bar is a step's mean over its launches; hover a bar for every launch. Launches in different series (v13, v15, …) differ by a few percent even on the same build, so the table under the chart compares each step only with launches of the step before in the same series. S5 to S9 ran with the game on the HDD and S12 onward on the SSD (the row under the step names), so the jump from S9 to S12 also includes the move to the SSD. S0 is the unpatched game on the SSD, the headline's baseline; on the HDD it ran a little slower (hover it). From series v16 on, the desktop held about <span data-source="desktop_effect" data-field="same_build_desktop_drop_mib" data-row="0">—</span> MiB less video memory (the cause was not recorded), which on its own lowers the game's pinned RAM by about as much. S10 and S11 were candidates that were dropped. S5 to S7 brought the long freezes that S8 removed. S13 is not about speed (<span data-source="step_pairs" data-field="change_pct" data-where="step=S13">—</span>% against S12 in the same series): it makes the memory features size themselves from what the game used in earlier sessions, and switch themselves off on machines where they cannot help. S14 lets the index cache reuse all of the space it evicts (<span data-source="step_pairs" data-field="change_pct" data-where="step=S14">—</span>%). S15 stops the driver from throwing away render targets that are cleared every frame when vkd3d can prove nothing else used their memory (<span data-source="step_pairs" data-field="change_pct" data-where="step=S15">—</span>%). S16 takes locking and driver calls off the game's render thread without changing anything the GPU draws (<span data-source="step_pairs" data-field="change_pct" data-where="step=S16">—</span>%). The fight is now limited by the GPU itself: see How much is left.</p>
+    </header>
+    <div class="mm-grid">
+      <div class="mm-card mm-wide">
+        <h3 id="chart-fps">Frames per second</h3>
+        <div class="mm-chart dash-skeleton" id="fps-chart" data-source="by_step launches"></div>
+        <div class="mm-key"><span><i class="mm-swatch" id="key-accent"></i>current build</span></div>
+      </div>
+      <div class="mm-card mm-wide">
+        <h3 id="table-pairs">Each step against the one before, in the same series</h3>
+        <p class="mm-note">Only launches of the series where both steps ran on the same disk. From v12 on, a series alternates the two builds launch by launch; v10 and v11 ran each step once, in turn. Pinned RAM is the change in driver-pinned system RAM over the same launches.</p>
+        <div class="mm-tablewrap">
+          <table id="pairs-table" data-source="step_pairs" data-row-key="step">
+            <thead><tr><th data-field="step">Step</th><th data-field="against">Against</th><th data-field="series">Series</th><th class="num" data-field="launches">Launches</th><th class="num" data-field="before_fps">Before (fps)</th><th class="num" data-field="after_fps">After (fps)</th><th class="num" data-field="change_pct">Change (%)</th><th class="num" data-field="pinned_change_mib">Pinned RAM (MiB)</th><th data-field="note">Note</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="mm-card mm-wide">
+        <h3 id="chart-slow">Frames over 40 ms per minute (mean of its launches)</h3>
+        <div class="mm-chart dash-skeleton" id="slow-chart" data-source="by_step launches"></div>
+        <p class="mm-note">The headline's smoothness measure, step by step: frames that took longer than 40 ms, per minute of the fight.</p>
+      </div>
+      <div class="mm-card mm-wide">
+        <h3 id="chart-freezes">Frames over 100 ms per fight (mean of its launches)</h3>
+        <div class="mm-chart dash-skeleton" id="freeze-chart" data-source="by_step launches"></div>
+        <p class="mm-note">Every launch counted from the fight's start to the game's 3rd autosave request. From S8 on, <span data-source="freeze_split" data-field="near" data-row="0">—</span> of the <span data-source="freeze_split" data-field="all" data-row="0">—</span> per fight come within seconds of the game's first two autosaves: its own save stalls, the same in every build since. S5 to S7's were the index cache rescanning its ring, fixed in S8; they run far off this scale, so their bars are cut, with their values on top.</p>
+      </div>
+      <div class="mm-card mm-wide">
+        <h3 id="chart-pinned">Driver-pinned system RAM (MiB)</h3>
+        <div class="mm-chart dash-skeleton" id="pinned-chart" data-source="by_step launches"></div>
+        <p class="mm-note">Mean of each step's launches over all its series. The fall after S13 is the desktop, not a step: on the same S13 build the game pinned <span data-source="desktop_effect" data-field="same_build_pinned_drop_mib" data-row="0">—</span> MiB less in series v16 than in v15, when the desktop held <span data-source="desktop_effect" data-field="same_build_desktop_drop_mib" data-row="0">—</span> MiB less video memory. Within a series, the steps since S12 moved it little (Pinned RAM in the table above).</p>
+      </div>
+      <div class="mm-card mm-wide">
+        <h3 id="table-steps">What each step changed</h3>
+        <div class="mm-tablewrap">
+          <table id="steps-table" data-source="steps" data-row-key="step">
+            <thead><tr><th data-field="step">Step</th><th data-field="name">Name</th><th data-field="what_changed">What changed</th><th data-field="kind">Kind</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mm-section" id="chase">
+    <header>
+      <h2>Free roam: the Rhino chase</h2>
+      <p class="mm-note">The freezes during the chase were the graphics driver compiling shaders. Its cache of compiled shaders only worked on the SSD; on the HDD the same shaders were compiled again every launch. Missing lighting counts GPU submissions that read light grid pages with no memory behind them (the dark area), before and after the fix. First 150 s of each launch.</p>
+    </header>
+    <div class="mm-card">
+      <div class="mm-tablewrap">
+        <table id="chase-table" data-source="chase" data-row-key="run">
+          <thead><tr>
+            <th data-field="setup">Setup</th>
+            <th data-field="cache_drive">Cache on</th>
+            <th class="num" data-field="compile_seconds">Shader compiling (s)</th>
+            <th class="num" data-field="compiles_over_100ms">Compiles over 100 ms</th>
+            <th class="num" data-field="longest_compile_ms">Longest (ms)</th>
+            <th class="num" data-field="submissions_missing_lighting">Missing lighting</th>
+            <th data-field="run">Run</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="mm-section" id="static">
+    <header>
+      <h2>Static checkpoint scene</h2>
+      <p class="mm-note">The earlier benchmark: a frozen checkpoint scene with no gameplay, two interleaved rounds per arm, from unpatched to all of S5. Later builds run it just under the 60 fps the bench gives its hidden window, so it can only show small differences; steps since are measured in the fight (S15's clear keep was still checked in it, switched on and off live).</p>
+    </header>
+    <div class="mm-card">
+      <div class="mm-hbars dash-skeleton" id="static-chart" data-source="static_scene"></div>
+    </div>
+  </section>
+
+  <section class="mm-section" id="desktop">
+    <header>
+      <p class="mm-eyebrow"><i class="mm-eyedot" id="desk-dot"></i>Desktop side · Hyprland, not a game patch</p>
+      <h2>Gaming mode: the desktop steps aside</h2>
+      <p class="mm-note">While the game is on screen, gaming mode stops the bar and wallpaper, closes terminals (their sessions live on), disconnects the TV, and freezes every other app and swaps it out. Leaving the game's workspace brings it all back. The same build (S12) ran in both arms, with the game on screen and the launches interleaved. Each launch is measured to the game's 3rd autosave request, as in the step bench, but with the game on screen and a warm-up launch first these ran faster than the step bench's launches of the same build within hours (S12: <span data-source="s12_bench" data-field="gm_fps" data-row="0">—</span> fps here with the normal desktop, <span data-source="s12_bench" data-field="bench_fps" data-row="0">—</span> in the step bench), so compare fps only within this section.</p>
+    </header>
+    <div class="mm-tiles">
+      <div class="mm-tile">
+        <span class="mm-tile-label">Frames per second</span>
+        <span class="mm-big"><span data-source="gm_change" data-field="fps_gain_pct" data-row="0">—</span><span class="mm-unit">% more</span></span>
+        <span class="mm-from"><span data-source="gm_arms" data-field="fps" data-where="series=gm1&amp;arm=Normal%20desktop">—</span> to <span data-source="gm_arms" data-field="fps" data-where="series=gm1&amp;arm=Gaming%20mode">—</span> fps</span>
+      </div>
+      <div class="mm-tile">
+        <span class="mm-tile-label">Swap-ins per second, whole run</span>
+        <span class="mm-big"><span data-source="gm_change" data-field="swapins_drop_pct" data-row="0">—</span><span class="mm-unit">% fewer</span></span>
+        <span class="mm-from"><span data-source="gm_arms" data-field="swapins_per_s" data-where="series=gm1&amp;arm=Normal%20desktop">—</span> to <span data-source="gm_arms" data-field="swapins_per_s" data-where="series=gm1&amp;arm=Gaming%20mode">—</span> a second</span>
+      </div>
+      <div class="mm-tile">
+        <span class="mm-tile-label">The game's VRAM budget</span>
+        <span class="mm-big">+<span data-source="gm_change" data-field="budget_gain_mib" data-row="0">—</span><span class="mm-unit">MiB</span></span>
+        <span class="mm-from"><span data-source="gm_arms" data-field="video_budget_mib" data-where="series=gm1&amp;arm=Normal%20desktop">—</span> to <span data-source="gm_arms" data-field="video_budget_mib" data-where="series=gm1&amp;arm=Gaming%20mode">—</span> MiB</span>
+      </div>
+      <div class="mm-tile">
+        <span class="mm-tile-label">Game data moved into VRAM</span>
+        <span class="mm-big"><span data-source="gm_change" data-field="moved_to_vram_mib" data-row="0">—</span><span class="mm-unit">MiB</span></span>
+        <span class="mm-from">out of pinned system RAM</span>
+      </div>
+    </div>
+    <div class="mm-grid">
+      <div class="mm-card">
+        <h3 id="chart-gm-fps">Frames per second, per launch</h3>
+        <div class="mm-chart dash-skeleton" id="gm-fps-chart" data-source="gm_arms gaming_mode"></div>
+        <div class="mm-key"><span><i class="mm-dot ssd"></i>one launch</span><span><i class="mm-meanline"></i>mean of the arm</span></div>
+      </div>
+      <div class="mm-card">
+        <h3 id="chart-gm-swap">Swap-ins per second over each whole run</h3>
+        <div class="mm-chart dash-skeleton" id="gm-swap-chart" data-source="gm_arms gaming_mode"></div>
+        <div class="mm-key"><span><i class="mm-dot ssd"></i>one launch</span><span><i class="mm-meanline"></i>mean of the arm</span></div>
+      </div>
+      <div class="mm-card mm-wide">
+        <h3 id="chart-gm-mem">Where the game's memory lives (MiB)</h3>
+        <div class="mm-hbars dash-skeleton" id="gm-mem-chart" data-source="gm_arms"></div>
+        <div class="mm-key"><span><i class="mm-swatch" id="gm-key-vram"></i>In VRAM</span><span><i class="mm-swatch" id="gm-key-sys"></i>Pinned in system RAM</span></div>
+        <p class="mm-note">About the same total either way. Gaming mode doesn't make the game use more memory; it lets more of it sit in VRAM instead of being read across PCIe.</p>
+      </div>
+      <div class="mm-card mm-wide">
+        <h3 id="table-gm">Every launch</h3>
+        <p class="mm-note">A second series (gm2) switched gaming mode on before the game started. That raised the engine's startup budget by <span data-source="gm_change" data-field="launch_startup_gain_mib" data-row="0">—</span> MiB but changed nothing measurable: only <span data-source="gm_change" data-field="launch_fps_pct" data-row="0">—</span>% more fps, within noise, and the engine still moved <span data-source="gm_change" data-field="launch_demoted_mib" data-row="0">—</span> MiB of textures to system RAM. The engine decides that on its own, so it stays a game-side lever; the variant was dropped.</p>
+        <div class="mm-tablewrap">
+          <table id="gm-table" data-source="gaming_mode" data-row-key="run">
+            <thead><tr><th data-field="run">Run</th><th data-field="arm">Arm</th><th class="num" data-field="fps">fps</th><th class="num" data-field="swapins_per_s">Swap-ins / s (whole run)</th><th class="num" data-field="frames_over_100ms">Frames &gt; 100 ms</th><th class="num" data-field="video_budget_mib">Budget in play (MiB)</th><th class="num" data-field="startup_budget_mib">Budget at start (MiB)</th><th class="num" data-field="pinned_ram_mib">Pinned RAM (MiB)</th><th class="num" data-field="demoted_mib">Textures in RAM (MiB)</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <section class="mm-section" id="left">
+    <header>
+      <h2>How much is left</h2>
+      <p class="mm-note">The current build keeps the GPU busy <span data-source="summary" data-field="gpu_busy" data-where="build=Optimized">—</span>% of the time, about <span data-source="gpu_time" data-field="gpu_ms" data-where="build=Optimized">—</span> ms of each <span data-source="gpu_time" data-field="frame_ms" data-where="build=Optimized">—</span> ms frame. Unpatched, the GPU was busier (<span data-source="summary" data-field="gpu_busy" data-where="build=Unpatched">—</span>%) but needed about <span data-source="gpu_time" data-field="gpu_ms" data-where="build=Unpatched">—</span> ms a frame. In frames traced with GPU timestamps, the idle time splits into the game handing work over late (<span data-source="headroom" data-field="measured" data-where="area=GPU%20idle%3A%20the%20game%20hands%20work%20over%20late">—</span> ms a frame), the wait between that hand-over and vkd3d's submit (<span data-source="headroom" data-field="measured" data-where="area=GPU%20idle%3A%20between%20the%20game's%20hand-over%20and%20vkd3d's%20submit">—</span> ms, with vkd3d's submission thread busy for only about 0.15 ms of it) and submissions waiting for the GPU to start (up to <span data-source="headroom" data-field="measured" data-where="area=GPU%20idle%3A%20submitted%2C%20GPU%20not%20started%20yet">—</span> ms). Traced frames idle longer than untraced ones, so these are shares, not time to win. What remains is GPU work per frame and memory, listed below with what each would take.</p>
+    </header>
+    <div class="mm-grid">
+      <div class="mm-card mm-wide">
+        <h3 id="chart-gpu">Where a frame's GPU time went, at step S15</h3>
+        <div class="mm-stack dash-skeleton" id="gpu-stack" data-source="gpu_frame"></div>
+        <div class="mm-legend" id="gpu-legend" data-source="gpu_frame"></div>
+        <p class="mm-note">Sampled frames of the fight with GPU timestamps on, which lengthen them a little (these add up to <span data-source="gpu_frame_total" data-field="span_ms" data-row="0">—</span> ms). S16 changed only CPU-side work. Barrier-only segments are mostly particle work inside secondary command buffers, which the timer cannot see. The idle part also counts command buffers recorded before the sampled frame, which the timer does not track, so it is an upper bound.</p>
+      </div>
+      <div class="mm-card mm-wide">
+        <h3 id="table-headroom">Remaining levers</h3>
+        <div class="mm-tablewrap">
+          <table id="headroom-table" data-source="headroom" data-row-key="area">
+            <thead><tr><th data-field="area">Area</th><th class="num" data-field="measured">Measured</th><th data-field="unit">Unit</th><th data-field="measured_at">Measured at</th><th data-field="what_it_would_take">What it would take</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="mm-card mm-wide">
+        <h3 id="table-vram">Video memory, as the game reports it</h3>
+        <p class="mm-note">The game's last once-a-minute report in each launch, averaged per build, and the video memory every other process held meanwhile (the desktop). The game's budget is the card's 3 GB minus what every process uses, so S16's higher budget comes from the lighter desktop in its sessions, not from a step.</p>
+        <div class="mm-tablewrap">
+          <table id="vram-table" data-source="vram_by_build" data-row-key="build">
+            <thead><tr><th data-field="build">Build</th><th data-field="series">Launches</th><th class="num" data-field="video_budget_mib">Its budget (MiB)</th><th class="num" data-field="video_usage_mib">Its usage (MiB)</th><th class="num" data-field="over_budget_mib">Over budget (MiB)</th><th class="num" data-field="texture_usage_mib">Textures (MiB)</th><th class="num" data-field="demoted_mib">Moved to system RAM (MiB)</th><th class="num" data-field="desktop_vram_mib">Desktop's VRAM (MiB)</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+dash.calc('summary', {
+  title: 'Unpatched vs optimized',
+  description: 'Mean of the SSD launches of the unpatched game (S0) and the current build (the last step).',
+  inputs: ['launches', 'steps'],
+  fn: (launches, steps) => {
+    const r1 = (x) => Math.round(x * 10) / 10;
+    const mean = (rs, k) => rs.reduce((s, r) => s + Number(r[k]), 0) / rs.length;
+    const current = steps.reduce((a, b) => (Number(b.order) > Number(a.order) ? b : a)).step;
+    return [['Unpatched', 'S0'], ['Optimized', current]].map(([build, step]) => {
+      const rs = launches.filter((r) => r.step === step && r.disk === 'SSD');
+      return {
+        build, step, launches: rs.length, series: [...new Set(rs.map((r) => r.run.split('-')[0]))].join(' and '),
+        fps: r1(mean(rs, 'fps')), p95_ms: r1(mean(rs, 'p95_ms')),
+        slow_per_min: Math.round(mean(rs, 'over40_per_min')), over100: r1(mean(rs, 'frames_over_100ms')),
+        pinned_mib: Math.round(mean(rs, 'pinned_ram_mib')),
+        faults_k_per_min: r1(rs.reduce((s, r) => s + Number(r.game_major_faults) / Number(r.window_s) * 60, 0) / rs.length / 1000),
+        gpu_busy: r1(mean(rs, 'gpu_busy_pct')), desktop_vram_mib: Math.round(mean(rs, 'desktop_vram_mib'))
+      };
+    });
+  }
+});
+
+dash.calc('change', {
+  title: 'Change, unpatched to optimized',
+  description: 'Differences between the two rows of the comparison above.',
+  inputs: ['summary'],
+  fn: (summary) => {
+    const u = summary.find((r) => r.build === 'Unpatched');
+    const o = summary.find((r) => r.build === 'Optimized');
+    return [{
+      fps_gain_pct: Math.round((o.fps / u.fps - 1) * 100),
+      p95_saved_ms: Math.round((u.p95_ms - o.p95_ms) * 10) / 10,
+      slow_drop_pct: Math.round((1 - o.slow_per_min / u.slow_per_min) * 100),
+      pinned_saved_mib: u.pinned_mib - o.pinned_mib,
+      faults_drop_pct: Math.round((1 - o.faults_k_per_min / u.faults_k_per_min) * 100)
+    }];
+  }
+});
+
+dash.calc('by_step', {
+  title: 'Fight results by step',
+  description: "Mean of every fight launch at each step, across all series, in step order, with the disk the game ran from. A step measured on both disks (S0) takes its SSD launches, as the headline does.",
+  inputs: ['launches', 'steps'],
+  fn: (launches, steps) => steps.slice().sort((a, b) => Number(a.order) - Number(b.order)).map((s) => {
+    const all = launches.filter((r) => r.step === s.step);
+    const disks = [...new Set(all.map((r) => r.disk))];
+    const disk = disks.length > 1 ? 'SSD' : disks[0];
+    const rs = all.filter((r) => r.disk === disk);
+    const m = (k) => rs.reduce((a, r) => a + Number(r[k]), 0) / rs.length;
+    return {
+      step: s.step, order: Number(s.order), name: s.name, disk, launches: rs.length,
+      fps: Math.round(m('fps') * 10) / 10, slow_per_min: Math.round(m('over40_per_min')),
+      over100: Math.round(m('frames_over_100ms') * 10) / 10, pinned_mib: Math.round(m('pinned_ram_mib'))
+    };
+  }).filter((r) => r.launches)
+});
+
+dash.calc('vram_by_build', {
+  title: 'Game VRAM report by build',
+  description: "Means of the game's last once-a-minute report per build, how far its usage ran over its budget, and the desktop's video memory.",
+  inputs: ['vram'],
+  fn: (vram) => [...new Set(vram.map((r) => r.build))].map((b) => {
+    const rs = vram.filter((r) => r.build === b);
+    const m = (f) => rs.reduce((s, r) => s + f(r), 0) / rs.length;
+    const k = (key) => Math.round(m((r) => Number(r[key])));
+    return {
+      build: b, series: rs.length + ' in ' + [...new Set(rs.map((r) => r.run.split('-')[0]))].join(', '),
+      video_budget_mib: k('video_budget_mib'), video_usage_mib: k('video_usage_mib'),
+      over_budget_mib: Math.round(m((r) => Number(r.video_usage_mib) - Number(r.video_budget_mib))),
+      texture_usage_mib: k('texture_usage_mib'), demoted_mib: k('demoted_mib'), desktop_vram_mib: k('desktop_vram_mib')
+    };
+  })
+});
+
+dash.calc('step_pairs', {
+  title: 'Each step against the one before',
+  description: 'Mean fps of a step and the step before over the launch series where both ran on the same disk.',
+  inputs: ['launches', 'steps'],
+  fn: (launches, steps) => {
+    const order = steps.slice().sort((a, b) => Number(a.order) - Number(b.order));
+    const key = (r) => r.run.split('-')[0] + '|' + r.disk;
+    const mean = (rs, k = 'fps') => rs.reduce((s, r) => s + Number(r[k]), 0) / rs.length;
+    return order.slice(1).map((s, i) => {
+      const prev = order[i].step;
+      const both = [...new Set(launches.filter((r) => r.step === s.step).map(key))]
+        .filter((k) => launches.some((r) => r.step === prev && key(r) === k));
+      if (!both.length) {
+        return { step: s.step, against: prev, series: '—', launches: '—', before_fps: '—', after_fps: '—', change_pct: '—',
+          pinned_change_mib: '—', note: 'No series ran both on the same disk' };
+      }
+      const a = launches.filter((r) => r.step === prev && both.includes(key(r)));
+      const b = launches.filter((r) => r.step === s.step && both.includes(key(r)));
+      const pct = Math.round((mean(b) / mean(a) - 1) * 10000) / 100;
+      const pin = Math.round(mean(b, 'pinned_ram_mib') - mean(a, 'pinned_ram_mib'));
+      return { step: s.step, against: prev, series: both.map((k) => k.split('|')[0]).join(', '),
+        launches: a.length + ' + ' + b.length, before_fps: Math.round(mean(a) * 100) / 100,
+        after_fps: Math.round(mean(b) * 100) / 100, change_pct: (pct > 0 ? '+' : '') + pct,
+        pinned_change_mib: (pin > 0 ? '+' : '') + pin, note: '' };
+    });
+  }
+});
+
+dash.calc('desktop_effect', {
+  title: 'The lighter desktop from series v16 on',
+  description: "The same S13 build in series v15 and v16: how much less video memory the desktop held and how much less RAM the game pinned; the fps it is worth, scaled from the gaming-mode series' fps per MiB of budget.",
+  inputs: ['launches', 'summary', 'gm_change'],
+  fn: (launches, summary, gm_change) => {
+    const s13 = (v) => launches.filter((r) => r.step === 'S13' && r.run.split('-')[0] === v);
+    const mean = (rs, k) => rs.reduce((s, r) => s + Number(r[k]), 0) / rs.length;
+    const a = s13('v15'), b = s13('v16');
+    const u = summary.find((r) => r.build === 'Unpatched'), o = summary.find((r) => r.build === 'Optimized');
+    const drop = u.desktop_vram_mib - o.desktop_vram_mib;
+    return [{
+      same_build_desktop_drop_mib: Math.round(mean(a, 'desktop_vram_mib') - mean(b, 'desktop_vram_mib')),
+      same_build_pinned_drop_mib: Math.round(mean(a, 'pinned_ram_mib') - mean(b, 'pinned_ram_mib')),
+      headline_desktop_drop_mib: drop,
+      fps_est_pct: Math.round(Number(gm_change[0].fps_gain_pct) * drop / gm_change[0].budget_gain_mib * 10) / 10
+    }];
+  }
+});
+
+dash.calc('s12_bench', {
+  title: 'S12: step bench against the gaming-mode series',
+  description: 'Mean fps of the S12 launches in the step bench (game hidden) and in gm1 with the normal desktop (game on screen, warm-up launch first).',
+  inputs: ['launches', 'gm_arms'],
+  fn: (launches, gm_arms) => {
+    const rs = launches.filter((r) => r.step === 'S12');
+    const bench = rs.reduce((s, r) => s + Number(r.fps), 0) / rs.length;
+    const gm = gm_arms.find((r) => r.series === 'gm1' && r.arm === 'Normal desktop').fps;
+    return [{ bench_fps: Math.round(bench * 100) / 100, gm_fps: gm, gap_pct: Math.round((gm / bench - 1) * 1000) / 10 }];
+  }
+});
+
+dash.calc('freeze_split', {
+  title: 'Frames over 100 ms since S8',
+  description: "Mean per launch from S8 on, and how many came between 1 s before and 4 s after the game's 1st or 2nd autosave request.",
+  inputs: ['launches', 'steps'],
+  fn: (launches, steps) => {
+    const ord = Object.fromEntries(steps.map((s) => [s.step, Number(s.order)]));
+    const rs = launches.filter((r) => ord[r.step] >= ord.S8);
+    const m = (k) => Math.round(rs.reduce((s, r) => s + Number(r[k]), 0) / rs.length * 10) / 10;
+    return [{ launches: rs.length, all: m('frames_over_100ms'), near: m('over100_near_autosave') }];
+  }
+});
+
+dash.calc('gpu_time', {
+  title: 'GPU time per frame',
+  description: 'Frame time from the mean fps, and the share of it the GPU was busy.',
+  inputs: ['summary'],
+  fn: (summary) => summary.map((r) => ({
+    build: r.build, frame_ms: Math.round(10000 / r.fps) / 10, gpu_ms: Math.round(100 * r.gpu_busy / r.fps) / 10
+  }))
+});
+
+dash.calc('gpu_frame_total', {
+  title: 'Sampled GPU frame',
+  description: 'Total of the GPU frame breakdown: work and idle.',
+  inputs: ['gpu_frame'],
+  fn: (gpu_frame) => [{
+    span_ms: Math.round(gpu_frame.reduce((s, r) => s + Number(r.ms_per_frame), 0) * 100) / 100
+  }]
+});
+
+dash.calc('gm_arms', {
+  title: 'Gaming mode: means per arm',
+  description: "Mean of each series' launches in each arm.",
+  inputs: ['gaming_mode'],
+  fn: (gaming_mode) => {
+    const keys = [...new Set(gaming_mode.map((r) => r.series + '|' + r.arm))];
+    return keys.map((k) => {
+      const [series, arm] = k.split('|');
+      const rs = gaming_mode.filter((r) => r.series === series && r.arm === arm);
+      const m = (f) => rs.reduce((s, r) => s + Number(r[f]), 0) / rs.length;
+      return {
+        series, arm, launches: rs.length, fps: Math.round(m('fps') * 100) / 100,
+        swapins_per_s: Math.round(m('swapins_per_s')), video_budget_mib: Math.round(m('video_budget_mib')),
+        video_usage_mib: Math.round(m('video_usage_mib')), pinned_ram_mib: Math.round(m('pinned_ram_mib')),
+        demoted_mib: Math.round(m('demoted_mib')), startup_budget_mib: Math.round(m('startup_budget_mib'))
+      };
+    });
+  }
+});
+
+dash.calc('gm_change', {
+  title: 'Gaming mode: change',
+  description: 'gm1: gaming mode against the normal desktop; gm2: gaming mode from launch against gaming mode.',
+  inputs: ['gm_arms'],
+  fn: (gm_arms) => {
+    const g = (s, a) => gm_arms.find((r) => r.series === s && r.arm === a);
+    const a = g('gm1', 'Normal desktop'), b = g('gm1', 'Gaming mode');
+    const b2 = g('gm2', 'Gaming mode'), c = g('gm2', 'Gaming mode from launch');
+    return [{
+      fps_gain_pct: (Math.round((b.fps / a.fps - 1) * 1000) / 10).toFixed(1),
+      swapins_drop_pct: Math.round((1 - b.swapins_per_s / a.swapins_per_s) * 100),
+      budget_gain_mib: b.video_budget_mib - a.video_budget_mib,
+      moved_to_vram_mib: a.pinned_ram_mib - b.pinned_ram_mib,
+      launch_startup_gain_mib: c.startup_budget_mib - b2.startup_budget_mib,
+      launch_fps_pct: (Math.round((c.fps / b2.fps - 1) * 1000) / 10).toFixed(1),
+      launch_demoted_mib: c.demoted_mib
+    }];
+  }
+});
+
+(function () {
+  let ACCENT_STEP = null; // the current build: the last step
+  const fmt = { fps: d3.format('.1f'), int: d3.format(','), one: d3.format(',.1f'),
+    small: (v) => (v >= 20 ? d3.format(',.0f')(v) : d3.format('.1f')(v)) };
+  document.getElementById('key-accent').style.background = dash.colors[0];
+
+  function setState(el, st) {
+    el.querySelectorAll('.mm-failed').forEach((n) => n.remove());
+    if (st === 'ok') { el.classList.remove('dash-skeleton'); return true; }
+    if (st === 'error' || st === 'connect' || st === 'declined' || st === 'missing') {
+      el.classList.remove('dash-skeleton');
+      el.querySelectorAll('svg, .mm-tip').forEach((n) => n.remove());
+      const f = document.createElement('div'); f.className = 'mm-failed'; f.textContent = 'Failed to load';
+      el.appendChild(f);
+    } else {
+      el.classList.add('dash-skeleton');
+    }
+    return false;
+  }
+
+  function fill(sel) {
+    document.querySelectorAll(sel).forEach((el) => {
+      const d = dash.data(el.dataset.source);
+      if (d.status !== 'ok') { el.textContent = '—'; return; }
+      const rows = d.data;
+      let row = null;
+      if (el.dataset.row !== undefined) row = rows[Number(el.dataset.row)];
+      else if (el.dataset.where) {
+        const pairs = el.dataset.where.split('&').map((p) => p.split('=').map(decodeURIComponent));
+        row = rows.find((r) => pairs.every(([k, v]) => String(r[k]) === v));
+      }
+      el.textContent = row ? String(row[el.dataset.field]) : '—';
+    });
+  }
+
+  function tipFor(box) {
+    let t = box.querySelector('.mm-tip');
+    if (!t) { t = document.createElement('div'); t.className = 'mm-tip'; t.hidden = true; box.appendChild(t); }
+    return t;
+  }
+  function showTip(box, t, head, lines, x, y) {
+    t.replaceChildren();
+    const h = document.createElement('div'); h.className = 'mm-tip-head'; h.textContent = head; t.appendChild(h);
+    lines.forEach((l) => { const d = document.createElement('div'); d.className = 'mm-tip-row'; d.textContent = l; t.appendChild(d); });
+    t.hidden = false;
+    const bw = box.clientWidth, tw = t.offsetWidth;
+    t.style.left = Math.max(0, Math.min(bw - tw, x - tw / 2)) + 'px';
+    t.style.top = Math.max(0, y - t.offsetHeight - 10) + 'px';
+  }
+
+  // Vertical bars per step in step order, the mean of its launches; under the step names, the disk the game ran from.
+  // cutOutliers: bars over 5x the median are cut at the top of the axis with a break mark and keep their value, so the
+  // other steps stay readable. Value labels that would overlap the one before are left out (the current build's is kept).
+  function drawBars(box, rows, field, valFmt, unit, launches, launchField, opts = {}) {
+    box.querySelectorAll('svg, .mm-tip').forEach((n) => n.remove());
+    const W = Math.max(240, box.clientWidth), H = 248;
+    const m = { t: 22, r: 6, b: 50, l: 6 };
+    const svg = d3.select(box).append('svg').attr('width', '100%').attr('viewBox', `0 0 ${W} ${H}`)
+      .attr('role', 'img').attr('aria-label', box.previousElementSibling ? box.previousElementSibling.textContent : '');
+    const x = d3.scaleBand(rows.map((r) => r.step), [m.l, W - m.r]).padding(0.3);
+    const vals = rows.map((r) => r[field]), med = d3.median(vals);
+    const cut = (v) => opts.cutOutliers && v > 5 * med;
+    const cap = vals.some(cut) ? d3.max(vals.filter((v) => !cut(v))) * 1.6 : d3.max(vals);
+    const y = d3.scaleLinear([0, (cap || 1) * 1.15], [H - m.b, m.t]);
+    const topY = (r) => (cut(r[field]) ? y(cap * 1.1) : y(r[field]));
+    const bw = Math.min(40, x.bandwidth());
+    const mid = (r) => x(r.step) + x.bandwidth() / 2;
+    svg.append('line').attr('x1', m.l).attr('x2', W - m.r).attr('y1', y(0)).attr('y2', y(0))
+      .attr('stroke', 'var(--cds-chart-axis)').attr('stroke-width', 1);
+    svg.append('g').selectAll('rect').data(rows).join('rect')
+      .attr('x', (r) => mid(r) - bw / 2).attr('width', bw)
+      .attr('y', topY).attr('height', (r) => Math.max(0, y(0) - topY(r)))
+      .attr('rx', 4).attr('fill', (r) => (r.step === ACCENT_STEP ? dash.colors[0] : 'var(--cds-chart-muted)'));
+    rows.filter((r) => cut(r[field])).forEach((r) => {
+      const yb = y(cap * 0.95);
+      [0, 6].forEach((dy) => svg.append('line').attr('x1', mid(r) - bw / 2 - 3).attr('x2', mid(r) + bw / 2 + 3)
+        .attr('y1', yb + dy + 4).attr('y2', yb + dy - 4).attr('stroke', 'var(--color-panel)').attr('stroke-width', 2.5));
+    });
+    const kept = [];
+    svg.append('g').selectAll('text').data(rows).join('text').attr('class', 'mm-val')
+      .attr('x', mid).attr('y', (r) => topY(r) - 7).attr('text-anchor', 'middle')
+      .text((r) => valFmt(r[field]))
+      .each(function (r) {
+        const b = this.getBBox(), prev = kept[kept.length - 1];
+        const box = { el: this, x: b.x, right: b.x + b.width, y: b.y, bottom: b.y + b.height };
+        if (!prev || box.x >= prev.right + 6 || box.y >= prev.bottom + 2 || box.bottom <= prev.y - 2) { kept.push(box); return; }
+        if (r.step === ACCENT_STEP) { prev.el.remove(); kept[kept.length - 1] = box; } else this.remove();
+      });
+    svg.append('g').selectAll('text').data(rows).join('text')
+      .attr('x', mid).attr('y', H - m.b + 16).attr('text-anchor', 'middle').text((r) => r.step);
+    // The disk row: one bracket per run of consecutive steps on the same disk.
+    const runs = [];
+    rows.forEach((r) => { const last = runs[runs.length - 1]; if (last && last.disk === r.disk) last.rows.push(r); else runs.push({ disk: r.disk, rows: [r] }); });
+    runs.forEach((g) => {
+      const x0 = x(g.rows[0].step) + 2, x1 = x(g.rows[g.rows.length - 1].step) + x.bandwidth() - 2;
+      const yl = H - m.b + 26;
+      svg.append('path').attr('d', `M${x0},${yl - 3}V${yl}H${x1}V${yl - 3}`).attr('fill', 'none')
+        .attr('stroke', 'var(--cds-chart-axis)').attr('stroke-width', 1);
+      const t = svg.append('text').attr('x', (x0 + x1) / 2).attr('y', H - 6).attr('text-anchor', 'middle')
+        .text(`game on the ${g.disk}`);
+      if (t.node().getComputedTextLength() > x1 - x0) t.text(g.disk);
+    });
+    const tip = tipFor(box);
+    svg.append('g').selectAll('rect').data(rows).join('rect')
+      .attr('x', (r) => x(r.step) - (x.step() - x.bandwidth()) / 2).attr('width', x.step())
+      .attr('y', m.t).attr('height', H - m.t - m.b).attr('fill', 'transparent')
+      .on('mouseenter mousemove', (ev, r) => {
+        const own = launches.filter((l) => l.step === r.step);
+        const both = new Set(own.map((l) => l.disk)).size > 1;
+        const lines = [`Mean ${valFmt(r[field])}${unit} over ${r.launches} launch${r.launches === 1 ? '' : 'es'}${both ? ' on the ' + r.disk : ''}`];
+        own.forEach((l) => lines.push(`${l.run}${both ? ' (' + l.disk + (l.disk === r.disk ? ')' : ', not in the bar)') : ''}: ${valFmt(Number(l[launchField]))}${unit}`));
+        const [px, py] = d3.pointer(ev, box);
+        showTip(box, tip, `${r.step} · ${r.name}`, lines, px, py);
+      })
+      .on('mouseleave', () => { tip.hidden = true; });
+  }
+
+  // One column per arm: a dot per launch and a line at the arm's mean, on an axis fitted to the launches
+  // (dots, not bars, so it need not start at zero). The gaming-mode arm in the desktop accent.
+  function drawArms(box, rows, dots, valFmt, unit, accentArm) {
+    box.querySelectorAll('svg, .mm-tip').forEach((n) => n.remove());
+    const W = Math.max(240, box.clientWidth), H = 208;
+    const m = { t: 14, r: 10, b: 26, l: 44 };
+    const svg = d3.select(box).append('svg').attr('width', '100%').attr('viewBox', `0 0 ${W} ${H}`)
+      .attr('role', 'img').attr('aria-label', box.previousElementSibling ? box.previousElementSibling.textContent : '');
+    const x = d3.scaleBand(rows.map((r) => r.arm), [m.l, W - m.r]).padding(0.3);
+    const lo = d3.min(dots, (d) => d.v), hi = d3.max(dots, (d) => d.v), pad = (hi - lo) * 0.15 || 1;
+    const y = d3.scaleLinear([Math.max(0, lo - pad), hi + pad], [H - m.b, m.t]).nice();
+    const ticks = y.ticks(4);
+    svg.append('g').selectAll('line').data(ticks).join('line').attr('x1', m.l).attr('x2', W - m.r)
+      .attr('y1', (v) => y(v)).attr('y2', (v) => y(v)).attr('stroke', 'var(--cds-chart-grid, var(--color-border-line))').attr('stroke-width', 1);
+    svg.append('g').selectAll('text').data(ticks).join('text').attr('x', m.l - 8).attr('y', (v) => y(v) + 4)
+      .attr('text-anchor', 'end').text((v) => valFmt(v));
+    const color = (arm) => (arm === accentArm ? dash.colors[1] : 'var(--color-fg-muted)');
+    const cx = (arm) => x(arm) + x.bandwidth() / 2;
+    svg.append('g').selectAll('line').data(rows).join('line')
+      .attr('x1', (r) => cx(r.arm) - 30).attr('x2', (r) => cx(r.arm) + 30).attr('y1', (r) => y(r.v)).attr('y2', (r) => y(r.v))
+      .attr('stroke', (r) => color(r.arm)).attr('stroke-width', 2).attr('stroke-linecap', 'round');
+    svg.append('g').selectAll('text').data(rows).join('text').attr('class', 'mm-val')
+      .attr('x', (r) => cx(r.arm) + 38).attr('y', (r) => y(r.v) + 4).text((r) => valFmt(r.v));
+    d3.group(dots, (d) => d.arm).forEach((ds, arm) => {
+      ds.forEach((d, i) => {
+        svg.append('circle').attr('cx', cx(arm) + (i - (ds.length - 1) / 2) * 13).attr('cy', y(d.v)).attr('r', 4.5)
+          .attr('fill', 'var(--color-panel)').attr('stroke', color(arm)).attr('stroke-width', 2);
+      });
+    });
+    svg.append('g').selectAll('text').data(rows).join('text')
+      .attr('x', (r) => cx(r.arm)).attr('y', H - 6).attr('text-anchor', 'middle').text((r) => r.arm);
+    const t = tipFor(box);
+    svg.append('g').selectAll('rect').data(rows).join('rect')
+      .attr('x', (r) => x(r.arm) - (x.step() - x.bandwidth()) / 2).attr('width', x.step())
+      .attr('y', m.t).attr('height', H - m.t - m.b).attr('fill', 'transparent')
+      .on('mouseenter mousemove', (ev, r) => {
+        const lines = [`Mean ${valFmt(r.v)}${unit} over ${r.launches} launches`];
+        dots.filter((d) => d.arm === r.arm).forEach((d) => lines.push(`${d.run}: ${valFmt(d.v)}${unit}`));
+        const [px, py] = d3.pointer(ev, box);
+        showTip(box, t, r.arm, lines, px, py);
+      })
+      .on('mouseleave', () => { t.hidden = true; });
+  }
+
+  function drawTable(table, rows, numeric, extra) {
+    const body = table.querySelector('tbody');
+    body.replaceChildren();
+    const cols = [...table.querySelectorAll('th')].map((th) => th.dataset.field);
+    const key = table.dataset.rowKey;
+    rows.forEach((r) => {
+      const tr = document.createElement('tr');
+      if (key && !cols.includes(key)) tr.dataset.key = String(r[key]);
+      cols.forEach((c) => {
+        const td = document.createElement('td');
+        const v = r[c];
+        if (numeric.includes(c)) { td.className = 'num'; td.textContent = String(v); }
+        else { td.textContent = String(v); if (c === 'what_changed' || c === 'what_it_would_take' || c === 'setup') td.className = 'wrap'; }
+        if (c === 'run') td.className = 'muted';
+        if (extra) extra(td, c, r);
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+  }
+
+  dash.onData(() => {
+    fill('[data-source][data-field]:not(th)');
+    const sum = dash.data('summary'), chg = dash.data('change');
+    const take = document.getElementById('takeaway');
+    if (sum.status === 'ok' && chg.status === 'ok') take.classList.remove('dash-skeleton');
+
+    // Step charts
+    const bs = dash.data('by_step'), la = dash.data('launches');
+    if (bs.status === 'ok' && bs.data.length) ACCENT_STEP = bs.data[bs.data.length - 1].step;
+    const fpsBox = document.getElementById('fps-chart');
+    const bsState = bs.status === 'ok' && la.status === 'ok' ? 'ok' : (bs.status !== 'ok' ? bs.status : la.status);
+    if (setState(fpsBox, bsState)) drawBars(fpsBox, bs.data, 'fps', fmt.fps, ' fps', la.data, 'fps');
+    const slBox = document.getElementById('slow-chart');
+    if (setState(slBox, bsState)) drawBars(slBox, bs.data, 'slow_per_min', fmt.int, ' a minute', la.data, 'over40_per_min');
+    const frBox = document.getElementById('freeze-chart');
+    if (setState(frBox, bsState)) drawBars(frBox, bs.data, 'over100', fmt.small, '', la.data, 'frames_over_100ms', { cutOutliers: true });
+    const pnBox = document.getElementById('pinned-chart');
+    if (setState(pnBox, bsState)) drawBars(pnBox, bs.data, 'pinned_mib', fmt.int, ' MiB', la.data, 'pinned_ram_mib');
+
+    const sp = dash.data('step_pairs');
+    if (sp.status === 'ok') drawTable(document.getElementById('pairs-table'), sp.data, ['launches', 'before_fps', 'after_fps', 'change_pct', 'pinned_change_mib'],
+      (td, c) => { if (c === 'series' || c === 'note') td.className = 'muted'; });
+
+    const st = dash.data('steps');
+    const stT = document.getElementById('steps-table');
+    if (st.status === 'ok') drawTable(stT, st.data, []);
+
+    // Chase table with an in-cell bar for compile time
+    const ch = dash.data('chase');
+    const chT = document.getElementById('chase-table');
+    if (ch.status === 'ok') {
+      const maxC = d3.max(ch.data, (r) => Number(r.compile_seconds)) || 1;
+      drawTable(chT, ch.data, ['compile_seconds', 'compiles_over_100ms', 'longest_compile_ms', 'submissions_missing_lighting'], (td, c, r) => {
+        if (c === 'compile_seconds') {
+          const b = document.createElement('span'); b.className = 'mm-cellbar';
+          b.style.width = (4 * Number(r.compile_seconds) / maxC) + 'rem';
+          b.style.background = r.cache_drive === 'SSD' ? dash.colors[0] : 'var(--cds-chart-muted)';
+          td.appendChild(b);
+        }
+      });
+    }
+
+    // Static scene: one bar per arm at the mean of its two rounds, both rounds as numbers
+    const ss = dash.data('static_scene');
+    const ssBox = document.getElementById('static-chart');
+    if (setState(ssBox, ss.status)) {
+      ssBox.replaceChildren();
+      const rows = ss.data.slice().sort((a, b) => Number(a.order) - Number(b.order));
+      const maxV = d3.max(rows, (r) => Math.max(Number(r.fps_round1), Number(r.fps_round2))) || 1;
+      rows.forEach((r) => {
+        const mean = (Number(r.fps_round1) + Number(r.fps_round2)) / 2;
+        const wrap = document.createElement('div'); wrap.className = 'mm-hbar';
+        const lab = document.createElement('div'); lab.className = 'mm-hbar-label'; lab.textContent = r.label;
+        const row = document.createElement('div'); row.className = 'mm-hbar-row';
+        const track = document.createElement('div'); track.className = 'mm-hbar-track';
+        const f = document.createElement('div'); f.className = 'mm-hbar-fill';
+        f.style.width = (100 * mean / maxV) + '%';
+        f.style.background = 'var(--cds-chart-muted)';
+        track.appendChild(f);
+        const num = document.createElement('div'); num.className = 'mm-hbar-num';
+        const nb = document.createElement('b'); nb.textContent = `${fmt.fps(mean)} fps`;
+        const nr = document.createElement('span'); nr.className = 'mm-hbar-rounds'; nr.textContent = ` (rounds ${r.fps_round1}, ${r.fps_round2})`;
+        num.append(nb, nr);
+        row.append(track, num); wrap.append(lab, row); ssBox.appendChild(wrap);
+      });
+    }
+
+    // GPU frame breakdown
+    const gf = dash.data('gpu_frame');
+    const stack = document.getElementById('gpu-stack'), legend = document.getElementById('gpu-legend');
+    if (setState(stack, gf.status)) {
+      stack.replaceChildren(); legend.replaceChildren();
+      const total = d3.sum(gf.data, (r) => Number(r.ms_per_frame)) || 1;
+      let wi = 0;
+      gf.data.forEach((r) => {
+        const color = r.kind === 'work' ? dash.colors[wi++ % dash.colors.length] : 'var(--cds-chart-muted)';
+        const seg = document.createElement('div');
+        seg.style.width = (100 * Number(r.ms_per_frame) / total) + '%';
+        seg.style.background = color;
+        stack.appendChild(seg);
+        const li = document.createElement('div');
+        const sw = document.createElement('i'); sw.className = 'mm-swatch'; sw.style.background = color;
+        const name = document.createElement('span'); name.textContent = r.part;
+        const val = document.createElement('span'); val.className = 'mm-num'; val.textContent = `${r.ms_per_frame} ms`;
+        li.append(sw, name, val); legend.appendChild(li);
+      });
+    } else {
+      legend.replaceChildren();
+    }
+
+    // Gaming mode (desktop side): series gm1, the normal desktop against gaming mode
+    const desk = dash.colors[1];
+    document.getElementById('desk-dot').style.background = desk;
+    document.getElementById('gm-key-vram').style.background = desk;
+    document.getElementById('gm-key-sys').style.background = 'var(--cds-chart-muted)';
+    const ga = dash.data('gm_arms'), gl = dash.data('gaming_mode');
+    const gmState = ga.status === 'ok' && gl.status === 'ok' ? 'ok' : (ga.status !== 'ok' ? ga.status : gl.status);
+    [['gm-fps-chart', 'fps', fmt.fps, ' fps'], ['gm-swap-chart', 'swapins_per_s', d3.format(',.0f'), '/s']].forEach(([id, field, f, unit]) => {
+      const box = document.getElementById(id);
+      if (!setState(box, gmState)) return;
+      const rows = ga.data.filter((r) => r.series === 'gm1').map((r) => ({ arm: r.arm, v: Number(r[field]), launches: r.launches }));
+      const dots = gl.data.filter((r) => r.series === 'gm1').map((r) => ({ arm: r.arm, v: Number(r[field]), run: r.run }));
+      drawArms(box, rows, dots, f, unit, 'Gaming mode');
+    });
+    const memBox = document.getElementById('gm-mem-chart');
+    if (setState(memBox, ga.status)) {
+      memBox.replaceChildren();
+      const rows = ga.data.filter((r) => r.series === 'gm1');
+      const maxT = d3.max(rows, (r) => r.video_usage_mib + r.pinned_ram_mib) || 1;
+      rows.forEach((r) => {
+        const wrap = document.createElement('div'); wrap.className = 'mm-hbar';
+        const lab = document.createElement('div'); lab.className = 'mm-hbar-label'; lab.textContent = r.arm;
+        const row = document.createElement('div'); row.className = 'mm-hbar-row';
+        const track = document.createElement('div'); track.className = 'mm-hbar-track mm-split';
+        const v = document.createElement('div'); v.style.width = (100 * r.video_usage_mib / maxT) + '%'; v.style.background = desk;
+        const sy = document.createElement('div'); sy.style.width = (100 * r.pinned_ram_mib / maxT) + '%'; sy.style.background = 'var(--cds-chart-muted)';
+        track.append(v, sy);
+        const num = document.createElement('div'); num.className = 'mm-hbar-num';
+        num.textContent = `${fmt.int(r.video_usage_mib)} + ${fmt.int(r.pinned_ram_mib)}`;
+        row.append(track, num); wrap.append(lab, row); memBox.appendChild(wrap);
+      });
+    }
+    if (gl.status === 'ok') {
+      drawTable(document.getElementById('gm-table'), gl.data,
+        ['fps', 'swapins_per_s', 'frames_over_100ms', 'video_budget_mib', 'startup_budget_mib', 'pinned_ram_mib', 'demoted_mib']);
+    }
+
+    const hr = dash.data('headroom');
+    if (hr.status === 'ok') drawTable(document.getElementById('headroom-table'), hr.data, ['measured']);
+    const vr = dash.data('vram_by_build');
+    if (vr.status === 'ok') drawTable(document.getElementById('vram-table'), vr.data, ['video_budget_mib', 'video_usage_mib', 'over_budget_mib', 'texture_usage_mib', 'demoted_mib', 'desktop_vram_mib'],
+      (td, c) => { if (c === 'series') td.className = 'muted'; });
+  });
+})();
+</script>
+
+

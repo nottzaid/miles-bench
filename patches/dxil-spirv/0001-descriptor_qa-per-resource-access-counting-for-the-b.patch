@@ -1,3 +1,14 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zaid <nottzaid@tutamail.com>
+Date: Wed, 14 Oct 2026 18:32:07 +0300
+Subject: [PATCH] descriptor_qa: per-resource access counting for the bench QA
+ build
+
+---
+ descriptor_qa.cpp | 20 ++++++++++++++++++++
+ descriptor_qa.hpp |  5 +++++
+ 2 files changed, 25 insertions(+)
+
 diff --git a/descriptor_qa.cpp b/descriptor_qa.cpp
 index 21054b55..f5589f10 100644
 --- a/descriptor_qa.cpp

@@ -1,0 +1,6 @@
+part,ms_per_frame,kind
+Render passes,10.6,work
+Compute passes,9.59,work
+Barrier-only segments,1.07,work
+Copies,0.58,work
+Idle between command buffers (upper bound),2.9,idle
