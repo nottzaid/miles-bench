@@ -1,0 +1,4264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zaid <nottzaid@tutamail.com>
+Date: Wed, 21 Oct 2026 01:14:05 +0300
+Subject: [PATCH 10/12] miles-bench: deferred command recording through a
+ replay worker (VKD3D_BENCH_CMD_REPLAY=1)
+
+Command lists' Vulkan command buffers record into per-buffer op streams that one worker thread
+replays into the driver, taking the driver's recording cost (~20% of the render thread) off the
+critical path. Same calls, same arguments, same order per command buffer. Wrappers for every device
+function that can see a command buffer are generated (cmdreplay_gen.py) so a tagged handle never
+reaches the driver; pool operations, submission and destroys order themselves after the worker.
+---
+ libs/vkd3d/cmdreplay.c      | 1394 +++++++++++++++++++
+ libs/vkd3d/cmdreplay_gen.h  | 2617 +++++++++++++++++++++++++++++++++++
+ libs/vkd3d/cmdreplay_gen.py |  142 ++
+ libs/vkd3d/command.c        |    5 +
+ libs/vkd3d/device.c         |    1 +
+ libs/vkd3d/meson.build      |    1 +
+ libs/vkd3d/swapchain.c      |    1 +
+ libs/vkd3d/vkd3d_private.h  |    5 +
+ 8 files changed, 4166 insertions(+)
+ create mode 100644 libs/vkd3d/cmdreplay.c
+ create mode 100644 libs/vkd3d/cmdreplay_gen.h
+ create mode 100644 libs/vkd3d/cmdreplay_gen.py
+
+diff --git a/libs/vkd3d/cmdreplay.c b/libs/vkd3d/cmdreplay.c
+new file mode 100644
+index 00000000..3d1f7178
+--- /dev/null
++++ b/libs/vkd3d/cmdreplay.c
+@@ -0,0 +1,1394 @@
++/*
++ * Deferred command recording (miles-bench, VKD3D_BENCH_CMD_REPLAY=1).
++ *
++ * Miles Morales records nearly all of its rendering on one thread ("Render Thread"), and that thread
++ * is the CPU critical path; ~20% of it is the Vulkan driver (vkCmd* through winevulkan into
++ * libnvidia-glcore) recording what vkd3d already worked out. Here the command buffers of D3D12
++ * command lists record into a stream instead: each vkCmd* call appends its arguments (deep-copied)
++ * to the command buffer's stream, and one worker thread replays the streams into the real command
++ * buffers, in order, while the render thread goes on. The driver sees the same calls with the same
++ * arguments in the same order on each command buffer, so the GPU work is identical.
++ *
++ * Handles: command buffers allocated from a command allocator's pools (registered in command.c) are
++ * handed to vkd3d as a tagged pointer (bit 0 set) to their struct rp_cb. Every device function that
++ * can see a command buffer is wrapped (cmdreplay_gen.py generates the wrappers and fails the build
++ * script if one is missing): a tagged handle is recorded or untagged, never passed to the driver.
++ *
++ * Ordering and Vulkan's external synchronization:
++ *   - A command buffer's ops sit in its own stream (chunks), so a list handed between threads keeps
++ *     its order. A chunk is published to the worker's FIFO when it is full enough, and at
++ *     vkEndCommandBuffer; the worker replays chunks in publication order.
++ *   - A command pool and its buffers are touched only by the worker while it has their ops, so pool
++ *     operations (allocate, free, reset, destroy) first wait until the worker has finished
++ *     everything published (and drop the unpublished ops of buffers they reset or free: those
++ *     commands are discarded by the operation anyway).
++ *   - Submission waits until the worker has replayed each command buffer's vkEndCommandBuffer.
++ *   - vkCmd* calls without a recorder (rare ones) publish the buffer's stream, wait for the worker,
++ *     and call the driver directly on the recording thread (the worker is then done with the pool).
++ *   - Destroying or freeing an object waits for every published op first: a replayed op may name it.
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++
++#include "vkd3d_private.h"
++
++struct rp_op
++{
++    void (*replay)(VkCommandBuffer cb, const struct rp_op *op);
++    uint32_t size;
++};
++
++struct rp_chunk
++{
++    struct rp_chunk *next;
++    VkCommandBuffer vk_cb;
++    uint64_t seq;
++    uint32_t used, cap, ops, pad;
++    uint64_t pad2; /* data[] 16-byte aligned */
++    uint8_t data[];
++};
++
++struct rp_pool
++{
++    VkCommandPool vk_pool;
++    struct rp_cb *cbs;
++    struct rp_pool *next;
++};
++
++struct rp_cb
++{
++    VkCommandBuffer vk_cb;
++    struct rp_pool *pool;
++    struct rp_cb *pool_next;
++    struct rp_chunk *chunk; /* ops not yet published */
++    uint64_t end_seq;       /* chunk holding the last vkEndCommandBuffer */
++};
++
++#define RP_TAGGED(cb) ((uintptr_t)(cb) & 1)
++#define RP_CB(cb) ((struct rp_cb *)((uintptr_t)(cb) & ~(uintptr_t)1))
++#define RP_HANDLE(c) ((VkCommandBuffer)((uintptr_t)(c) | 1))
++
++#define RP_CHUNK_SIZE (64u << 10)
++/* A chunk is published once it holds this many ops (at the next op): the worker replays a long
++ * command buffer while it is still being recorded. */
++#define RP_PUBLISH_OPS 96
++/* Pause loops before sleeping: the worker between chunks, waiters for the worker. */
++#define RP_WORKER_SPIN 20000
++#define RP_WAIT_SPIN 4000
++
++static struct vkd3d_vk_device_procs rp_real;
++
++static struct
++{
++    bool enabled;
++    pthread_mutex_t lock;
++    pthread_cond_t work_cond, done_cond;
++    struct rp_chunk *head, *tail, *free;
++    uint64_t published; /* written under lock */
++    uint64_t done;      /* last chunk replayed */
++    LONG waiters;
++    bool sleeping;
++    pthread_t thread;
++
++    pthread_mutex_t pool_lock;
++    struct rp_pool *pools;
++
++    /* Measurement: ops recorded, chunks replayed, direct calls by name, waits. */
++    uint64_t ops, chunks, guard_waits, submit_waits, pool_waits, wait_us, dropped, deferred_destroys;
++    uint64_t drains[];
++} *rp_state;
++
++#define rp (*rp_state)
++
++static void rp_spin_pause(void)
++{
++#if defined(__i386__) || defined(__x86_64__)
++    __builtin_ia32_pause();
++#endif
++}
++
++static uint64_t rp_now_us(void)
++{
++    LARGE_INTEGER t, f;
++
++    QueryPerformanceCounter(&t);
++    QueryPerformanceFrequency(&f);
++    return (uint64_t)(t.QuadPart * 1000000.0 / f.QuadPart);
++}
++
++static struct rp_chunk *rp_chunk_get(VkCommandBuffer vk_cb, uint32_t min_size)
++{
++    struct rp_chunk *k = NULL;
++    uint32_t cap = max(RP_CHUNK_SIZE, min_size);
++
++    if (cap == RP_CHUNK_SIZE)
++    {
++        pthread_mutex_lock(&rp.lock);
++        if ((k = rp.free))
++            rp.free = k->next;
++        pthread_mutex_unlock(&rp.lock);
++    }
++    if (!k && !(k = vkd3d_malloc(sizeof(*k) + cap)))
++        return NULL;
++    k->next = NULL;
++    k->vk_cb = vk_cb;
++    k->seq = 0;
++    k->used = 0;
++    k->cap = cap;
++    k->ops = 0;
++    return k;
++}
++
++static void rp_chunk_put(struct rp_chunk *k)
++{
++    if (k->cap != RP_CHUNK_SIZE)
++    {
++        vkd3d_free(k);
++        return;
++    }
++    pthread_mutex_lock(&rp.lock);
++    k->next = rp.free;
++    rp.free = k;
++    pthread_mutex_unlock(&rp.lock);
++}
++
++static uint64_t rp_publish_chunk(struct rp_chunk *k)
++{
++    uint64_t seq;
++    bool wake;
++
++    pthread_mutex_lock(&rp.lock);
++    seq = k->seq = rp.published + 1;
++    __atomic_store_n(&rp.published, seq, __ATOMIC_RELEASE);
++    if (rp.tail)
++        rp.tail->next = k;
++    else
++        __atomic_store_n(&rp.head, k, __ATOMIC_RELEASE);
++    rp.tail = k;
++    wake = rp.sleeping;
++    pthread_mutex_unlock(&rp.lock);
++    if (wake)
++        pthread_cond_signal(&rp.work_cond);
++    return seq;
++}
++
++/* Publishes the buffer's pending ops; returns the sequence number the worker reaches once they are
++ * replayed (the last published one when there was nothing to publish). */
++static uint64_t rp_publish(struct rp_cb *c)
++{
++    struct rp_chunk *k = c->chunk;
++
++    c->chunk = NULL;
++    if (k && !k->ops)
++    {
++        rp_chunk_put(k);
++        k = NULL;
++    }
++    if (!k)
++        return __atomic_load_n(&rp.published, __ATOMIC_ACQUIRE);
++    return rp_publish_chunk(k);
++}
++
++/* A destroy queued behind everything published (no command buffer): a chunk of its own holding one op,
++ * or NULL when the worker has nothing left to replay (the caller destroys right away). */
++static struct rp_chunk *rp_defer_chunk(void (*replay)(VkCommandBuffer, const struct rp_op *), size_t size)
++{
++    struct rp_chunk *k;
++    struct rp_op *op;
++
++    if (__atomic_load_n(&rp.done, __ATOMIC_ACQUIRE) >= __atomic_load_n(&rp.published, __ATOMIC_ACQUIRE))
++        return NULL;
++    size = align(size, 16);
++    if (!(k = rp_chunk_get(VK_NULL_HANDLE, size)))
++        return NULL;
++    op = (struct rp_op *)k->data;
++    op->replay = replay;
++    op->size = size;
++    k->used = size;
++    k->ops = 1;
++    __atomic_add_fetch(&rp.deferred_destroys, 1, __ATOMIC_RELAXED);
++    return k;
++}
++
++static void rp_drop(struct rp_cb *c)
++{
++    if (c->chunk)
++    {
++        rp_chunk_put(c->chunk);
++        c->chunk = NULL;
++        __atomic_add_fetch(&rp.dropped, 1, __ATOMIC_RELAXED);
++    }
++}
++
++static void rp_wait(uint64_t seq, uint64_t *counter)
++{
++    uint64_t start;
++    unsigned int i;
++
++    if (__atomic_load_n(&rp.done, __ATOMIC_ACQUIRE) >= seq)
++        return;
++    start = rp_now_us();
++    __atomic_add_fetch(counter, 1, __ATOMIC_RELAXED);
++    for (i = 0; i < RP_WAIT_SPIN; i++)
++    {
++        if (__atomic_load_n(&rp.done, __ATOMIC_ACQUIRE) >= seq)
++            goto done;
++        rp_spin_pause();
++    }
++    pthread_mutex_lock(&rp.lock);
++    __atomic_add_fetch(&rp.waiters, 1, __ATOMIC_SEQ_CST);
++    while (__atomic_load_n(&rp.done, __ATOMIC_SEQ_CST) < seq)
++        pthread_cond_wait(&rp.done_cond, &rp.lock);
++    __atomic_sub_fetch(&rp.waiters, 1, __ATOMIC_SEQ_CST);
++    pthread_mutex_unlock(&rp.lock);
++done:
++    __atomic_add_fetch(&rp.wait_us, rp_now_us() - start, __ATOMIC_RELAXED);
++}
++
++/* Everything published so far has been replayed. */
++static void rp_guard(void)
++{
++    rp_wait(__atomic_load_n(&rp.published, __ATOMIC_ACQUIRE), &rp.guard_waits);
++}
++
++static void *rp_op_alloc(struct rp_cb *c, void (*replay)(VkCommandBuffer, const struct rp_op *), size_t size)
++{
++    struct rp_chunk *k = c->chunk;
++    struct rp_op *op;
++
++    size = align(size, 16);
++    if (k && (k->ops >= RP_PUBLISH_OPS || k->used + size > k->cap))
++    {
++        rp_publish(c);
++        k = NULL;
++    }
++    if (!k && !(k = c->chunk = rp_chunk_get(c->vk_cb, size)))
++    {
++        ERR("cmdreplay: out of memory.\n");
++        abort();
++    }
++    op = (struct rp_op *)(k->data + k->used);
++    k->used += size;
++    k->ops++;
++    op->replay = replay;
++    op->size = size;
++    return op;
++}
++
++/* For a call made directly: the worker has replayed everything this buffer published before. */
++static VkCommandBuffer rp_drain_for_direct(struct rp_cb *c, unsigned int index)
++{
++    __atomic_add_fetch(&rp.drains[index], 1, __ATOMIC_RELAXED);
++    rp_wait(rp_publish(c), &rp.pool_waits);
++    return c->vk_cb;
++}
++
++#include "cmdreplay_gen.h"
++
++/* Hand-written recorders that fell back to a direct call (an extension struct they do not copy),
++ * counted after the generated drains. */
++enum rp_hand
++{
++    RP_HAND_BEGIN = RP_DRAIN_COUNT,
++    RP_HAND_BARRIER,
++    RP_HAND_RENDERING,
++    RP_HAND_BIND_DB,
++    RP_HAND_COPY,
++    RP_HAND_PUSH_DESC,
++    RP_HAND_EXEC,
++    RP_HAND_COUNT,
++};
++
++static const char *const rp_hand_names[] =
++{
++    "vkBeginCommandBuffer", "vkCmdPipelineBarrier2", "vkCmdBeginRendering", "vkCmdBindDescriptorBuffersEXT",
++    "vkCmdCopy*2", "vkCmdPushDescriptorSetKHR", "vkCmdExecuteCommands",
++};
++
++static void rp_worker_replay(struct rp_chunk *k)
++{
++    const uint8_t *p = k->data, *end = k->data + k->used;
++    const struct rp_op *op;
++
++    while (p < end)
++    {
++        op = (const struct rp_op *)p;
++        op->replay(k->vk_cb, op);
++        p += op->size;
++    }
++}
++
++static void *rp_worker_main(void *arg)
++{
++    struct rp_chunk *k;
++    unsigned int i;
++
++    (void)arg;
++    vkd3d_set_thread_name("vkd3d_cmdrep");
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++    for (;;)
++    {
++        pthread_mutex_lock(&rp.lock);
++        while (!rp.head)
++        {
++            pthread_mutex_unlock(&rp.lock);
++            for (i = 0; i < RP_WORKER_SPIN && !__atomic_load_n(&rp.head, __ATOMIC_ACQUIRE); i++)
++                rp_spin_pause();
++            pthread_mutex_lock(&rp.lock);
++            if (rp.head)
++                break;
++            rp.sleeping = true;
++            pthread_cond_wait(&rp.work_cond, &rp.lock);
++            rp.sleeping = false;
++        }
++        k = rp.head;
++        __atomic_store_n(&rp.head, k->next, __ATOMIC_RELEASE);
++        if (!rp.head)
++            rp.tail = NULL;
++        pthread_mutex_unlock(&rp.lock);
++
++        rp_worker_replay(k);
++        rp.ops += k->ops;
++        rp.chunks++;
++        __atomic_store_n(&rp.done, k->seq, __ATOMIC_SEQ_CST);
++        if (__atomic_load_n(&rp.waiters, __ATOMIC_SEQ_CST))
++        {
++            pthread_mutex_lock(&rp.lock);
++            pthread_cond_broadcast(&rp.done_cond);
++            pthread_mutex_unlock(&rp.lock);
++        }
++        rp_chunk_put(k);
++    }
++    return NULL;
++}
++
++/* Copies count elements of size bytes after the op; NULL stays NULL. */
++#define RP_ARRAY(dst, src, count) do { \
++        if ((src) && (count)) { memcpy(payload, (src), sizeof(*(src)) * (count)); (dst) = (void *)payload; \
++            payload += align(sizeof(*(src)) * (count), 16); } else (dst) = NULL; } while (0)
++#define RP_ARRAY_SIZE(src, count) (((src) && (count)) ? align(sizeof(*(src)) * (count), 16) : 0)
++
++/* Command buffer lifetime */
++
++struct rp_op_begin
++{
++    struct rp_op h;
++    VkCommandBufferUsageFlags flags;
++};
++
++static void rp_replay_begin(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_begin *op = (const void *)h;
++    VkCommandBufferBeginInfo info;
++    VkResult vr;
++
++    info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    info.pNext = NULL;
++    info.flags = op->flags;
++    info.pInheritanceInfo = NULL;
++    if ((vr = rp_real.vkBeginCommandBuffer(cb, &info)) < 0)
++        ERR("cmdreplay: vkBeginCommandBuffer failed, vr %d.\n", vr);
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL rp_vkBeginCommandBuffer(VkCommandBuffer commandBuffer,
++        const VkCommandBufferBeginInfo *info)
++{
++    struct rp_op_begin *op;
++    struct rp_cb *c;
++
++    if (!RP_TAGGED(commandBuffer))
++        return rp_real.vkBeginCommandBuffer(commandBuffer, info);
++    c = RP_CB(commandBuffer);
++    if (info->pNext || info->pInheritanceInfo)
++        return rp_real.vkBeginCommandBuffer(rp_drain_for_direct(c, RP_HAND_BEGIN), info);
++    op = rp_op_alloc(c, rp_replay_begin, sizeof(*op));
++    op->flags = info->flags;
++    return VK_SUCCESS;
++}
++
++static void rp_replay_end(VkCommandBuffer cb, const struct rp_op *h)
++{
++    VkResult vr;
++
++    (void)h;
++    if ((vr = rp_real.vkEndCommandBuffer(cb)) < 0)
++        ERR("cmdreplay: vkEndCommandBuffer failed, vr %d.\n", vr);
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL rp_vkEndCommandBuffer(VkCommandBuffer commandBuffer)
++{
++    struct rp_cb *c;
++
++    if (!RP_TAGGED(commandBuffer))
++        return rp_real.vkEndCommandBuffer(commandBuffer);
++    c = RP_CB(commandBuffer);
++    rp_op_alloc(c, rp_replay_end, sizeof(struct rp_op));
++    c->end_seq = rp_publish(c);
++    return VK_SUCCESS;
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL rp_vkResetCommandBuffer(VkCommandBuffer commandBuffer,
++        VkCommandBufferResetFlags flags)
++{
++    struct rp_cb *c;
++
++    if (!RP_TAGGED(commandBuffer))
++        return rp_real.vkResetCommandBuffer(commandBuffer, flags);
++    c = RP_CB(commandBuffer);
++    rp_drop(c);
++    rp_wait(__atomic_load_n(&rp.published, __ATOMIC_ACQUIRE), &rp.pool_waits);
++    return rp_real.vkResetCommandBuffer(c->vk_cb, flags);
++}
++
++/* Pools */
++
++static struct rp_pool *rp_pool_find(VkCommandPool vk_pool)
++{
++    struct rp_pool *pool;
++
++    pthread_mutex_lock(&rp.pool_lock);
++    for (pool = rp.pools; pool; pool = pool->next)
++        if (pool->vk_pool == vk_pool)
++            break;
++    pthread_mutex_unlock(&rp.pool_lock);
++    return pool;
++}
++
++void vkd3d_cmd_replay_register_pool(VkCommandPool vk_pool)
++{
++    struct rp_pool *pool;
++
++    if (!rp_state || !vk_pool || rp_pool_find(vk_pool))
++        return;
++    if (!(pool = vkd3d_calloc(1, sizeof(*pool))))
++        return;
++    pool->vk_pool = vk_pool;
++    pthread_mutex_lock(&rp.pool_lock);
++    pool->next = rp.pools;
++    rp.pools = pool;
++    pthread_mutex_unlock(&rp.pool_lock);
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL rp_vkAllocateCommandBuffers(VkDevice device,
++        const VkCommandBufferAllocateInfo *info, VkCommandBuffer *cbs)
++{
++    struct rp_pool *pool;
++    struct rp_cb *c;
++    uint32_t i, j;
++    VkResult vr;
++
++    if (!(pool = rp_pool_find(info->commandPool)) || info->level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
++    {
++        if (pool)
++            rp_guard();
++        return rp_real.vkAllocateCommandBuffers(device, info, cbs);
++    }
++    rp_guard();
++    if ((vr = rp_real.vkAllocateCommandBuffers(device, info, cbs)) < 0)
++        return vr;
++    for (i = 0; i < info->commandBufferCount; i++)
++    {
++        if (!(c = vkd3d_calloc(1, sizeof(*c))))
++        {
++            for (j = 0; j < i; j++)
++            {
++                c = RP_CB(cbs[j]);
++                pool->cbs = c->pool_next;
++                cbs[j] = c->vk_cb;
++                vkd3d_free(c);
++            }
++            rp_real.vkFreeCommandBuffers(device, info->commandPool, info->commandBufferCount, cbs);
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
++        }
++        c->vk_cb = cbs[i];
++        c->pool = pool;
++        c->pool_next = pool->cbs;
++        pool->cbs = c;
++        cbs[i] = RP_HANDLE(c);
++    }
++    return VK_SUCCESS;
++}
++
++static void rp_pool_unlink(struct rp_pool *pool, struct rp_cb *c)
++{
++    struct rp_cb **p;
++
++    for (p = &pool->cbs; *p; p = &(*p)->pool_next)
++    {
++        if (*p == c)
++        {
++            *p = c->pool_next;
++            return;
++        }
++    }
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkFreeCommandBuffers(VkDevice device, VkCommandPool vk_pool,
++        uint32_t count, const VkCommandBuffer *cbs)
++{
++    VkCommandBuffer stack[16], *real = stack;
++    struct rp_cb *c;
++    uint32_t i;
++
++    rp_guard();
++    if (count > ARRAY_SIZE(stack) && !(real = vkd3d_malloc(count * sizeof(*real))))
++        return;
++    for (i = 0; i < count; i++)
++    {
++        if (!RP_TAGGED(cbs[i]))
++        {
++            real[i] = cbs[i];
++            continue;
++        }
++        c = RP_CB(cbs[i]);
++        rp_drop(c);
++        rp_pool_unlink(c->pool, c);
++        real[i] = c->vk_cb;
++        vkd3d_free(c);
++    }
++    rp_real.vkFreeCommandBuffers(device, vk_pool, count, real);
++    if (real != stack)
++        vkd3d_free(real);
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL rp_vkResetCommandPool(VkDevice device, VkCommandPool vk_pool,
++        VkCommandPoolResetFlags flags)
++{
++    struct rp_pool *pool;
++    struct rp_cb *c;
++
++    if ((pool = rp_pool_find(vk_pool)))
++        for (c = pool->cbs; c; c = c->pool_next)
++            rp_drop(c);
++    /* Unregistered pools too: a replayed vkCmdExecuteCommands may name their secondaries. */
++    rp_guard();
++    return rp_real.vkResetCommandPool(device, vk_pool, flags);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyCommandPool(VkDevice device, VkCommandPool vk_pool,
++        const VkAllocationCallbacks *allocator)
++{
++    struct rp_pool *pool, **p;
++    struct rp_cb *c, *next;
++
++    pthread_mutex_lock(&rp.pool_lock);
++    for (p = &rp.pools; (pool = *p); p = &pool->next)
++    {
++        if (pool->vk_pool == vk_pool)
++        {
++            *p = pool->next;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&rp.pool_lock);
++    if (pool)
++    {
++        for (c = pool->cbs; c; c = c->pool_next)
++            rp_drop(c);
++    }
++    rp_guard();
++    rp_real.vkDestroyCommandPool(device, vk_pool, allocator);
++    if (pool)
++    {
++        for (c = pool->cbs; c; c = next)
++        {
++            next = c->pool_next;
++            vkd3d_free(c);
++        }
++        vkd3d_free(pool);
++    }
++}
++
++/* Submission */
++
++static uint64_t rp_untag(VkCommandBuffer *cb)
++{
++    struct rp_cb *c;
++
++    if (!RP_TAGGED(*cb))
++        return 0;
++    c = RP_CB(*cb);
++    *cb = c->vk_cb;
++    return c->end_seq;
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL rp_vkQueueSubmit2(VkQueue queue, uint32_t count,
++        const VkSubmitInfo2 *submits, VkFence fence)
++{
++    VkCommandBufferSubmitInfo stack_cbs[64], *cbs = stack_cbs;
++    VkSubmitInfo2 stack_submits[16], *copy = stack_submits;
++    uint32_t i, j, total = 0, n = 0;
++    uint64_t seq, wait = 0;
++    bool tagged = false;
++    VkResult vr;
++
++    for (i = 0; i < count; i++)
++    {
++        total += submits[i].commandBufferInfoCount;
++        for (j = 0; j < submits[i].commandBufferInfoCount; j++)
++            tagged |= RP_TAGGED(submits[i].pCommandBufferInfos[j].commandBuffer);
++    }
++    if (!tagged)
++        return rp_real.vkQueueSubmit2(queue, count, submits, fence);
++
++    if (total > ARRAY_SIZE(stack_cbs) && !(cbs = vkd3d_malloc(total * sizeof(*cbs))))
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    if (count > ARRAY_SIZE(stack_submits) && !(copy = vkd3d_malloc(count * sizeof(*copy))))
++    {
++        if (cbs != stack_cbs)
++            vkd3d_free(cbs);
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
++    for (i = 0; i < count; i++)
++    {
++        copy[i] = submits[i];
++        copy[i].pCommandBufferInfos = &cbs[n];
++        for (j = 0; j < submits[i].commandBufferInfoCount; j++, n++)
++        {
++            cbs[n] = submits[i].pCommandBufferInfos[j];
++            if ((seq = rp_untag(&cbs[n].commandBuffer)) > wait)
++                wait = seq;
++        }
++    }
++    rp_wait(wait, &rp.submit_waits);
++    vr = rp_real.vkQueueSubmit2(queue, count, copy, fence);
++    if (cbs != stack_cbs)
++        vkd3d_free(cbs);
++    if (copy != stack_submits)
++        vkd3d_free(copy);
++    return vr;
++}
++
++/* Debug names may name a command buffer. */
++
++static VKAPI_ATTR VkResult VKAPI_CALL rp_vkSetDebugUtilsObjectNameEXT(VkDevice device,
++        const VkDebugUtilsObjectNameInfoEXT *info)
++{
++    VkDebugUtilsObjectNameInfoEXT copy = *info;
++
++    if (copy.objectType == VK_OBJECT_TYPE_COMMAND_BUFFER && (copy.objectHandle & 1))
++        copy.objectHandle = (uint64_t)(uintptr_t)RP_CB((VkCommandBuffer)(uintptr_t)copy.objectHandle)->vk_cb;
++    return rp_real.vkSetDebugUtilsObjectNameEXT(device, &copy);
++}
++
++/* Recorders for commands that take pointers: the pointed-to data is copied after the op. A pNext
++ * these do not know falls back to a direct call. */
++
++struct rp_op_barrier
++{
++    struct rp_op h;
++    VkDependencyInfo info;
++};
++
++static void rp_replay_barrier(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_barrier *op = (const void *)h;
++    rp_real.vkCmdPipelineBarrier2(cb, &op->info);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPipelineBarrier2(VkCommandBuffer commandBuffer,
++        const VkDependencyInfo *info)
++{
++    struct rp_op_barrier *op;
++    uint8_t *payload;
++    struct rp_cb *c;
++    uint32_t i;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdPipelineBarrier2(commandBuffer, info);
++        return;
++    }
++    c = RP_CB(commandBuffer);
++    if (info->pNext)
++        goto direct;
++    for (i = 0; i < info->memoryBarrierCount; i++)
++        if (info->pMemoryBarriers[i].pNext)
++            goto direct;
++    for (i = 0; i < info->bufferMemoryBarrierCount; i++)
++        if (info->pBufferMemoryBarriers[i].pNext)
++            goto direct;
++    for (i = 0; i < info->imageMemoryBarrierCount; i++)
++        if (info->pImageMemoryBarriers[i].pNext)
++            goto direct;
++    op = rp_op_alloc(c, rp_replay_barrier, sizeof(*op) + 16
++            + RP_ARRAY_SIZE(info->pMemoryBarriers, info->memoryBarrierCount)
++            + RP_ARRAY_SIZE(info->pBufferMemoryBarriers, info->bufferMemoryBarrierCount)
++            + RP_ARRAY_SIZE(info->pImageMemoryBarriers, info->imageMemoryBarrierCount));
++    payload = (uint8_t *)(op + 1);
++    payload += (uintptr_t)-(uintptr_t)payload & 15;
++    op->info = *info;
++    RP_ARRAY(op->info.pMemoryBarriers, info->pMemoryBarriers, info->memoryBarrierCount);
++    RP_ARRAY(op->info.pBufferMemoryBarriers, info->pBufferMemoryBarriers, info->bufferMemoryBarrierCount);
++    RP_ARRAY(op->info.pImageMemoryBarriers, info->pImageMemoryBarriers, info->imageMemoryBarrierCount);
++    return;
++
++direct:
++    rp_real.vkCmdPipelineBarrier2(rp_drain_for_direct(c, RP_HAND_BARRIER), info);
++}
++
++struct rp_op_rendering
++{
++    struct rp_op h;
++    VkRenderingInfo info;
++    VkRenderingAttachmentInfo depth, stencil;
++};
++
++static void rp_replay_rendering(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_rendering *op = (const void *)h;
++    rp_real.vkCmdBeginRendering(cb, &op->info);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBeginRendering(VkCommandBuffer commandBuffer,
++        const VkRenderingInfo *info)
++{
++    struct rp_op_rendering *op;
++    uint8_t *payload;
++    struct rp_cb *c;
++    uint32_t i;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdBeginRendering(commandBuffer, info);
++        return;
++    }
++    c = RP_CB(commandBuffer);
++    if (info->pNext || (info->pDepthAttachment && info->pDepthAttachment->pNext) ||
++            (info->pStencilAttachment && info->pStencilAttachment->pNext))
++        goto direct;
++    for (i = 0; i < info->colorAttachmentCount; i++)
++        if (info->pColorAttachments[i].pNext)
++            goto direct;
++    op = rp_op_alloc(c, rp_replay_rendering, sizeof(*op) + 16
++            + RP_ARRAY_SIZE(info->pColorAttachments, info->colorAttachmentCount));
++    payload = (uint8_t *)(op + 1);
++    payload += (uintptr_t)-(uintptr_t)payload & 15;
++    op->info = *info;
++    RP_ARRAY(op->info.pColorAttachments, info->pColorAttachments, info->colorAttachmentCount);
++    if (info->pDepthAttachment)
++    {
++        op->depth = *info->pDepthAttachment;
++        op->info.pDepthAttachment = &op->depth;
++    }
++    if (info->pStencilAttachment)
++    {
++        op->stencil = *info->pStencilAttachment;
++        op->info.pStencilAttachment = &op->stencil;
++    }
++    return;
++
++direct:
++    rp_real.vkCmdBeginRendering(rp_drain_for_direct(c, RP_HAND_RENDERING), info);
++}
++
++struct rp_op_push_constants
++{
++    struct rp_op h;
++    VkPipelineLayout layout;
++    VkShaderStageFlags stages;
++    uint32_t offset, size;
++    uint8_t data[];
++};
++
++static void rp_replay_push_constants(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_push_constants *op = (const void *)h;
++    rp_real.vkCmdPushConstants(cb, op->layout, op->stages, op->offset, op->size, op->data);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
++        VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void *values)
++{
++    struct rp_op_push_constants *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdPushConstants(commandBuffer, layout, stages, offset, size, values);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_push_constants, sizeof(*op) + size);
++    op->layout = layout;
++    op->stages = stages;
++    op->offset = offset;
++    op->size = size;
++    memcpy(op->data, values, size);
++}
++
++struct rp_op_viewports
++{
++    struct rp_op h;
++    uint32_t first, count;
++    bool with_count;
++    VkViewport viewports[];
++};
++
++static void rp_replay_viewports(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_viewports *op = (const void *)h;
++    if (op->with_count)
++        rp_real.vkCmdSetViewportWithCount(cb, op->count, op->viewports);
++    else
++        rp_real.vkCmdSetViewport(cb, op->first, op->count, op->viewports);
++}
++
++static void rp_record_viewports(struct rp_cb *c, bool with_count, uint32_t first, uint32_t count,
++        const VkViewport *viewports)
++{
++    struct rp_op_viewports *op;
++
++    op = rp_op_alloc(c, rp_replay_viewports, sizeof(*op) + count * sizeof(*viewports));
++    op->first = first;
++    op->count = count;
++    op->with_count = with_count;
++    memcpy(op->viewports, viewports, count * sizeof(*viewports));
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetViewport(VkCommandBuffer commandBuffer, uint32_t first,
++        uint32_t count, const VkViewport *viewports)
++{
++    if (!RP_TAGGED(commandBuffer))
++        rp_real.vkCmdSetViewport(commandBuffer, first, count, viewports);
++    else
++        rp_record_viewports(RP_CB(commandBuffer), false, first, count, viewports);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t count,
++        const VkViewport *viewports)
++{
++    if (!RP_TAGGED(commandBuffer))
++        rp_real.vkCmdSetViewportWithCount(commandBuffer, count, viewports);
++    else
++        rp_record_viewports(RP_CB(commandBuffer), true, 0, count, viewports);
++}
++
++struct rp_op_scissors
++{
++    struct rp_op h;
++    uint32_t first, count;
++    bool with_count;
++    VkRect2D rects[];
++};
++
++static void rp_replay_scissors(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_scissors *op = (const void *)h;
++    if (op->with_count)
++        rp_real.vkCmdSetScissorWithCount(cb, op->count, op->rects);
++    else
++        rp_real.vkCmdSetScissor(cb, op->first, op->count, op->rects);
++}
++
++static void rp_record_scissors(struct rp_cb *c, bool with_count, uint32_t first, uint32_t count,
++        const VkRect2D *rects)
++{
++    struct rp_op_scissors *op;
++
++    op = rp_op_alloc(c, rp_replay_scissors, sizeof(*op) + count * sizeof(*rects));
++    op->first = first;
++    op->count = count;
++    op->with_count = with_count;
++    memcpy(op->rects, rects, count * sizeof(*rects));
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetScissor(VkCommandBuffer commandBuffer, uint32_t first,
++        uint32_t count, const VkRect2D *rects)
++{
++    if (!RP_TAGGED(commandBuffer))
++        rp_real.vkCmdSetScissor(commandBuffer, first, count, rects);
++    else
++        rp_record_scissors(RP_CB(commandBuffer), false, first, count, rects);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t count,
++        const VkRect2D *rects)
++{
++    if (!RP_TAGGED(commandBuffer))
++        rp_real.vkCmdSetScissorWithCount(commandBuffer, count, rects);
++    else
++        rp_record_scissors(RP_CB(commandBuffer), true, 0, count, rects);
++}
++
++struct rp_op_blend_constants
++{
++    struct rp_op h;
++    float constants[4];
++};
++
++static void rp_replay_blend_constants(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_blend_constants *op = (const void *)h;
++    rp_real.vkCmdSetBlendConstants(cb, op->constants);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetBlendConstants(VkCommandBuffer commandBuffer, const float constants[4])
++{
++    struct rp_op_blend_constants *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetBlendConstants(commandBuffer, constants);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_blend_constants, sizeof(*op));
++    memcpy(op->constants, constants, sizeof(op->constants));
++}
++
++struct rp_op_db_offsets
++{
++    struct rp_op h;
++    VkPipelineBindPoint bind_point;
++    VkPipelineLayout layout;
++    uint32_t first_set, set_count;
++    uint32_t *indices;
++    VkDeviceSize offsets[];
++};
++
++static void rp_replay_db_offsets(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_db_offsets *op = (const void *)h;
++    rp_real.vkCmdSetDescriptorBufferOffsetsEXT(cb, op->bind_point, op->layout, op->first_set, op->set_count,
++            op->indices, op->offsets);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetDescriptorBufferOffsetsEXT(VkCommandBuffer commandBuffer,
++        VkPipelineBindPoint bind_point, VkPipelineLayout layout, uint32_t first_set, uint32_t set_count,
++        const uint32_t *indices, const VkDeviceSize *offsets)
++{
++    struct rp_op_db_offsets *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetDescriptorBufferOffsetsEXT(commandBuffer, bind_point, layout, first_set, set_count,
++                indices, offsets);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_db_offsets,
++            sizeof(*op) + set_count * (sizeof(*offsets) + sizeof(*indices)));
++    op->bind_point = bind_point;
++    op->layout = layout;
++    op->first_set = first_set;
++    op->set_count = set_count;
++    memcpy(op->offsets, offsets, set_count * sizeof(*offsets));
++    op->indices = (uint32_t *)(op->offsets + set_count);
++    memcpy(op->indices, indices, set_count * sizeof(*indices));
++}
++
++struct rp_op_bind_db
++{
++    struct rp_op h;
++    uint32_t count;
++    VkDescriptorBufferBindingPushDescriptorBufferHandleEXT handles[2];
++    VkDescriptorBufferBindingInfoEXT infos[];
++};
++
++static void rp_replay_bind_db(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_bind_db *op = (const void *)h;
++    rp_real.vkCmdBindDescriptorBuffersEXT(cb, op->count, op->infos);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindDescriptorBuffersEXT(VkCommandBuffer commandBuffer, uint32_t count,
++        const VkDescriptorBufferBindingInfoEXT *infos)
++{
++    const VkDescriptorBufferBindingPushDescriptorBufferHandleEXT *handle;
++    struct rp_op_bind_db *op;
++    unsigned int handles = 0;
++    struct rp_cb *c;
++    uint32_t i;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdBindDescriptorBuffersEXT(commandBuffer, count, infos);
++        return;
++    }
++    c = RP_CB(commandBuffer);
++    for (i = 0; i < count; i++)
++    {
++        if (!(handle = infos[i].pNext))
++            continue;
++        if (handle->sType != VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_PUSH_DESCRIPTOR_BUFFER_HANDLE_EXT ||
++                handle->pNext || ++handles > ARRAY_SIZE(op->handles))
++        {
++            rp_real.vkCmdBindDescriptorBuffersEXT(rp_drain_for_direct(c, RP_HAND_BIND_DB), count, infos);
++            return;
++        }
++    }
++    op = rp_op_alloc(c, rp_replay_bind_db, sizeof(*op) + count * sizeof(*infos));
++    op->count = count;
++    memcpy(op->infos, infos, count * sizeof(*infos));
++    for (i = 0, handles = 0; i < count; i++)
++    {
++        if (!infos[i].pNext)
++            continue;
++        op->handles[handles] = *(const VkDescriptorBufferBindingPushDescriptorBufferHandleEXT *)infos[i].pNext;
++        op->infos[i].pNext = &op->handles[handles++];
++    }
++}
++
++struct rp_op_vertex_buffers
++{
++    struct rp_op h;
++    uint32_t first, count;
++    const VkDeviceSize *sizes, *strides;
++    VkDeviceSize *offsets;
++    VkBuffer buffers[];
++};
++
++static void rp_replay_vertex_buffers(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vertex_buffers *op = (const void *)h;
++    rp_real.vkCmdBindVertexBuffers2(cb, op->first, op->count, op->buffers, op->offsets, op->sizes, op->strides);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t first,
++        uint32_t count, const VkBuffer *buffers, const VkDeviceSize *offsets, const VkDeviceSize *sizes,
++        const VkDeviceSize *strides)
++{
++    struct rp_op_vertex_buffers *op;
++    VkDeviceSize *p;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdBindVertexBuffers2(commandBuffer, first, count, buffers, offsets, sizes, strides);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vertex_buffers,
++            sizeof(*op) + count * (sizeof(*buffers) + 3 * sizeof(VkDeviceSize)));
++    op->first = first;
++    op->count = count;
++    memcpy(op->buffers, buffers, count * sizeof(*buffers));
++    p = (VkDeviceSize *)(op->buffers + count);
++    op->offsets = p;
++    memcpy(p, offsets, count * sizeof(*p));
++    p += count;
++    op->sizes = sizes ? memcpy(p, sizes, count * sizeof(*p)) : NULL;
++    p += count;
++    op->strides = strides ? memcpy(p, strides, count * sizeof(*p)) : NULL;
++}
++
++struct rp_op_descriptor_sets
++{
++    struct rp_op h;
++    VkPipelineBindPoint bind_point;
++    VkPipelineLayout layout;
++    uint32_t first_set, set_count, dynamic_count;
++    const uint32_t *dynamic;
++    VkDescriptorSet sets[];
++};
++
++static void rp_replay_descriptor_sets(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_descriptor_sets *op = (const void *)h;
++    rp_real.vkCmdBindDescriptorSets(cb, op->bind_point, op->layout, op->first_set, op->set_count, op->sets,
++            op->dynamic_count, op->dynamic);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindDescriptorSets(VkCommandBuffer commandBuffer,
++        VkPipelineBindPoint bind_point, VkPipelineLayout layout, uint32_t first_set, uint32_t set_count,
++        const VkDescriptorSet *sets, uint32_t dynamic_count, const uint32_t *dynamic)
++{
++    struct rp_op_descriptor_sets *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdBindDescriptorSets(commandBuffer, bind_point, layout, first_set, set_count, sets,
++                dynamic_count, dynamic);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_descriptor_sets,
++            sizeof(*op) + set_count * sizeof(*sets) + dynamic_count * sizeof(*dynamic));
++    op->bind_point = bind_point;
++    op->layout = layout;
++    op->first_set = first_set;
++    op->set_count = set_count;
++    op->dynamic_count = dynamic_count;
++    memcpy(op->sets, sets, set_count * sizeof(*sets));
++    op->dynamic = dynamic_count ? memcpy(op->sets + set_count, dynamic, dynamic_count * sizeof(*dynamic)) : NULL;
++}
++
++struct rp_op_update_buffer
++{
++    struct rp_op h;
++    VkBuffer buffer;
++    VkDeviceSize offset, size;
++    uint8_t data[];
++};
++
++static void rp_replay_update_buffer(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_update_buffer *op = (const void *)h;
++    rp_real.vkCmdUpdateBuffer(cb, op->buffer, op->offset, op->size, op->data);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer buffer,
++        VkDeviceSize offset, VkDeviceSize size, const void *data)
++{
++    struct rp_op_update_buffer *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdUpdateBuffer(commandBuffer, buffer, offset, size, data);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_update_buffer, sizeof(*op) + size);
++    op->buffer = buffer;
++    op->offset = offset;
++    op->size = size;
++    memcpy(op->data, data, size);
++}
++
++/* Copies: the info struct and its regions. */
++struct rp_op_copy
++{
++    struct rp_op h;
++    union
++    {
++        VkCopyBufferInfo2 buffer;
++        VkCopyBufferToImageInfo2 to_image;
++        VkCopyImageToBufferInfo2 to_buffer;
++        VkCopyImageInfo2 image;
++    } u;
++};
++
++static void rp_replay_copy_buffer(VkCommandBuffer cb, const struct rp_op *h)
++{
++    rp_real.vkCmdCopyBuffer2(cb, &((const struct rp_op_copy *)(const void *)h)->u.buffer);
++}
++
++static void rp_replay_copy_to_image(VkCommandBuffer cb, const struct rp_op *h)
++{
++    rp_real.vkCmdCopyBufferToImage2(cb, &((const struct rp_op_copy *)(const void *)h)->u.to_image);
++}
++
++static void rp_replay_copy_to_buffer(VkCommandBuffer cb, const struct rp_op *h)
++{
++    rp_real.vkCmdCopyImageToBuffer2(cb, &((const struct rp_op_copy *)(const void *)h)->u.to_buffer);
++}
++
++static void rp_replay_copy_image(VkCommandBuffer cb, const struct rp_op *h)
++{
++    rp_real.vkCmdCopyImage2(cb, &((const struct rp_op_copy *)(const void *)h)->u.image);
++}
++
++#define RP_COPY_RECORDER(fn, info_type, member, replay) \
++static VKAPI_ATTR void VKAPI_CALL rp_##fn(VkCommandBuffer commandBuffer, const info_type *info) \
++{ \
++    struct rp_op_copy *op; \
++    struct rp_cb *c; \
++    uint32_t i; \
++\
++    if (!RP_TAGGED(commandBuffer)) \
++    { \
++        rp_real.fn(commandBuffer, info); \
++        return; \
++    } \
++    c = RP_CB(commandBuffer); \
++    if (info->pNext) \
++        goto direct; \
++    for (i = 0; i < info->regionCount; i++) \
++        if (info->pRegions[i].pNext) \
++            goto direct; \
++    op = rp_op_alloc(c, replay, sizeof(*op) + info->regionCount * sizeof(*info->pRegions)); \
++    op->u.member = *info; \
++    op->u.member.pRegions = memcpy(op + 1, info->pRegions, info->regionCount * sizeof(*info->pRegions)); \
++    return; \
++direct: \
++    rp_real.fn(rp_drain_for_direct(c, RP_HAND_COPY), info); \
++}
++
++RP_COPY_RECORDER(vkCmdCopyBuffer2, VkCopyBufferInfo2, buffer, rp_replay_copy_buffer)
++RP_COPY_RECORDER(vkCmdCopyBufferToImage2, VkCopyBufferToImageInfo2, to_image, rp_replay_copy_to_image)
++RP_COPY_RECORDER(vkCmdCopyImageToBuffer2, VkCopyImageToBufferInfo2, to_buffer, rp_replay_copy_to_buffer)
++RP_COPY_RECORDER(vkCmdCopyImage2, VkCopyImageInfo2, image, rp_replay_copy_image)
++
++struct rp_op_push_descriptors
++{
++    struct rp_op h;
++    VkPipelineBindPoint bind_point;
++    VkPipelineLayout layout;
++    uint32_t set, count;
++    VkWriteDescriptorSet writes[];
++};
++
++static void rp_replay_push_descriptors(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_push_descriptors *op = (const void *)h;
++    rp_real.vkCmdPushDescriptorSetKHR(cb, op->bind_point, op->layout, op->set, op->count, op->writes);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
++        VkPipelineBindPoint bind_point, VkPipelineLayout layout, uint32_t set, uint32_t count,
++        const VkWriteDescriptorSet *writes)
++{
++    struct rp_op_push_descriptors *op;
++    size_t size = 0;
++    uint8_t *payload;
++    struct rp_cb *c;
++    uint32_t i;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdPushDescriptorSetKHR(commandBuffer, bind_point, layout, set, count, writes);
++        return;
++    }
++    c = RP_CB(commandBuffer);
++    for (i = 0; i < count; i++)
++    {
++        if (writes[i].pNext)
++        {
++            rp_real.vkCmdPushDescriptorSetKHR(rp_drain_for_direct(c, RP_HAND_PUSH_DESC), bind_point, layout, set,
++                    count, writes);
++            return;
++        }
++        size += RP_ARRAY_SIZE(writes[i].pImageInfo, writes[i].descriptorCount)
++                + RP_ARRAY_SIZE(writes[i].pBufferInfo, writes[i].descriptorCount)
++                + RP_ARRAY_SIZE(writes[i].pTexelBufferView, writes[i].descriptorCount);
++    }
++    op = rp_op_alloc(c, rp_replay_push_descriptors, sizeof(*op) + count * sizeof(*writes) + 16 + size);
++    op->bind_point = bind_point;
++    op->layout = layout;
++    op->set = set;
++    op->count = count;
++    memcpy(op->writes, writes, count * sizeof(*writes));
++    payload = (uint8_t *)(op->writes + count);
++    payload += (uintptr_t)-(uintptr_t)payload & 15;
++    for (i = 0; i < count; i++)
++    {
++        RP_ARRAY(op->writes[i].pImageInfo, writes[i].pImageInfo, writes[i].descriptorCount);
++        RP_ARRAY(op->writes[i].pBufferInfo, writes[i].pBufferInfo, writes[i].descriptorCount);
++        RP_ARRAY(op->writes[i].pTexelBufferView, writes[i].pTexelBufferView, writes[i].descriptorCount);
++    }
++}
++
++struct rp_op_execute
++{
++    struct rp_op h;
++    uint32_t count;
++    VkCommandBuffer cbs[];
++};
++
++static void rp_replay_execute(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_execute *op = (const void *)h;
++    rp_real.vkCmdExecuteCommands(cb, op->count, op->cbs);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t count,
++        const VkCommandBuffer *cbs)
++{
++    VkCommandBuffer stack[16], *real = stack;
++    struct rp_op_execute *op;
++    uint32_t i;
++
++    if (RP_TAGGED(commandBuffer))
++    {
++        op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_execute, sizeof(*op) + count * sizeof(*cbs));
++        op->count = count;
++        for (i = 0; i < count; i++)
++            op->cbs[i] = RP_TAGGED(cbs[i]) ? RP_CB(cbs[i])->vk_cb : cbs[i];
++        return;
++    }
++    if (count > ARRAY_SIZE(stack) && !(real = vkd3d_malloc(count * sizeof(*real))))
++        return;
++    for (i = 0; i < count; i++)
++        real[i] = RP_TAGGED(cbs[i]) ? RP_CB(cbs[i])->vk_cb : cbs[i];
++    rp_real.vkCmdExecuteCommands(commandBuffer, count, real);
++    if (real != stack)
++        vkd3d_free(real);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPreprocessGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
++        const VkGeneratedCommandsInfoEXT *info, VkCommandBuffer stateCommandBuffer)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), RP_HAND_EXEC);
++    if (RP_TAGGED(stateCommandBuffer))
++        stateCommandBuffer = rp_drain_for_direct(RP_CB(stateCommandBuffer), RP_HAND_EXEC);
++    rp_real.vkCmdPreprocessGeneratedCommandsEXT(commandBuffer, info, stateCommandBuffer);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPreprocessGeneratedCommandsNV(VkCommandBuffer commandBuffer,
++        const VkGeneratedCommandsInfoNV *info)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), RP_HAND_EXEC);
++    rp_real.vkCmdPreprocessGeneratedCommandsNV(commandBuffer, info);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdExecuteGeneratedCommandsNV(VkCommandBuffer commandBuffer,
++        VkBool32 isPreprocessed, const VkGeneratedCommandsInfoNV *info)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), RP_HAND_EXEC);
++    rp_real.vkCmdExecuteGeneratedCommandsNV(commandBuffer, isPreprocessed, info);
++}
++
++/* Stats, from vkd3d_cmd_replay_report() (each present). */
++void vkd3d_cmd_replay_report(void)
++{
++    static uint64_t last_us, last_ops, last_chunks;
++    char text[1024];
++    uint64_t now, ops, chunks;
++    size_t len;
++    unsigned int i;
++
++    if (!rp_state || (now = rp_now_us()) - last_us < 20000000)
++        return;
++    if (!last_us)
++    {
++        last_us = now;
++        return;
++    }
++    ops = __atomic_load_n(&rp.ops, __ATOMIC_RELAXED);
++    chunks = __atomic_load_n(&rp.chunks, __ATOMIC_RELAXED);
++    len = snprintf(text, sizeof(text), "cmdreplay: %.0f ops/s in %.0f chunks/s; waits: submit %"PRIu64", pool %"PRIu64
++            ", guard %"PRIu64", %.1f ms total; %"PRIu64" destroys queued, %"PRIu64" chunks dropped; direct:",
++            (ops - last_ops) * 1e6 / (now - last_us), (chunks - last_chunks) * 1e6 / (now - last_us),
++            rp.submit_waits, rp.pool_waits, rp.guard_waits, rp.wait_us / 1000.0, rp.deferred_destroys, rp.dropped);
++    for (i = 0; i < RP_HAND_COUNT && len < sizeof(text) - 64; i++)
++    {
++        if (rp.drains[i])
++            len += snprintf(text + len, sizeof(text) - len, " %s %"PRIu64,
++                    i < RP_DRAIN_COUNT ? rp_drain_names[i] : rp_hand_names[i - RP_DRAIN_COUNT], rp.drains[i]);
++    }
++    INFO("%s.\n", text);
++    last_us = now;
++    last_ops = ops;
++    last_chunks = chunks;
++}
++
++#define RP_GEN_INSTALL
++#include "cmdreplay_gen.h"
++
++void vkd3d_cmd_replay_install(struct d3d12_device *device)
++{
++    char value[8];
++
++    if (!vkd3d_get_env_var("VKD3D_BENCH_CMD_REPLAY", value, sizeof(value)) || value[0] != '1')
++        return;
++    if (!rp_state)
++    {
++        if (!(rp_state = vkd3d_calloc(1, sizeof(*rp_state) + RP_HAND_COUNT * sizeof(rp_state->drains[0]))))
++            return;
++        rp_real = device->vk_procs;
++        pthread_mutex_init(&rp.lock, NULL);
++        pthread_mutex_init(&rp.pool_lock, NULL);
++        pthread_cond_init(&rp.work_cond, NULL);
++        pthread_cond_init(&rp.done_cond, NULL);
++        if (pthread_create(&rp.thread, NULL, rp_worker_main, NULL))
++        {
++            ERR("cmdreplay: failed to start the worker thread.\n");
++            vkd3d_free(rp_state);
++            rp_state = NULL;
++            return;
++        }
++        INFO("cmdreplay: command lists record through the replay worker.\n");
++    }
++    rp_install_procs(&device->vk_procs);
++}
++
++bool vkd3d_cmd_replay_enabled(void)
++{
++    return !!rp_state;
++}
+diff --git a/libs/vkd3d/cmdreplay_gen.h b/libs/vkd3d/cmdreplay_gen.h
+new file mode 100644
+index 00000000..c7ed71be
+--- /dev/null
++++ b/libs/vkd3d/cmdreplay_gen.h
+@@ -0,0 +1,2617 @@
++/* Generated by cmdreplay_gen.py from vulkan_core.h and vulkan_procs.h; do not edit. */
++
++#ifndef RP_GEN_INSTALL
++
++struct rp_op_vkCmdBeginQuery
++{
++    struct rp_op h;
++    VkQueryPool queryPool;
++    uint32_t query;
++    VkQueryControlFlags flags;
++};
++
++static void rp_replay_vkCmdBeginQuery(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdBeginQuery *op = (const void *)h;
++    rp_real.vkCmdBeginQuery(cb, op->queryPool, op->query, op->flags);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query, VkQueryControlFlags flags)
++{
++    struct rp_op_vkCmdBeginQuery *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdBeginQuery(commandBuffer, queryPool, query, flags);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdBeginQuery, sizeof(*op));
++    op->queryPool = queryPool;
++    op->query = query;
++    op->flags = flags;
++}
++
++struct rp_op_vkCmdBindIndexBuffer
++{
++    struct rp_op h;
++    VkBuffer buffer;
++    VkDeviceSize offset;
++    VkIndexType indexType;
++};
++
++static void rp_replay_vkCmdBindIndexBuffer(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdBindIndexBuffer *op = (const void *)h;
++    rp_real.vkCmdBindIndexBuffer(cb, op->buffer, op->offset, op->indexType);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindIndexBuffer(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkIndexType indexType)
++{
++    struct rp_op_vkCmdBindIndexBuffer *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdBindIndexBuffer(commandBuffer, buffer, offset, indexType);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdBindIndexBuffer, sizeof(*op));
++    op->buffer = buffer;
++    op->offset = offset;
++    op->indexType = indexType;
++}
++
++struct rp_op_vkCmdBindPipeline
++{
++    struct rp_op h;
++    VkPipelineBindPoint pipelineBindPoint;
++    VkPipeline pipeline;
++};
++
++static void rp_replay_vkCmdBindPipeline(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdBindPipeline *op = (const void *)h;
++    rp_real.vkCmdBindPipeline(cb, op->pipelineBindPoint, op->pipeline);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline)
++{
++    struct rp_op_vkCmdBindPipeline *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdBindPipeline(commandBuffer, pipelineBindPoint, pipeline);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdBindPipeline, sizeof(*op));
++    op->pipelineBindPoint = pipelineBindPoint;
++    op->pipeline = pipeline;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount, const VkBuffer* pBuffers, const VkDeviceSize* pOffsets)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 0);
++    rp_real.vkCmdBindVertexBuffers(commandBuffer, firstBinding, bindingCount, pBuffers, pOffsets);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBlitImage2(VkCommandBuffer commandBuffer, const VkBlitImageInfo2* pBlitImageInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 1);
++    rp_real.vkCmdBlitImage2(commandBuffer, pBlitImageInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount, const VkClearAttachment* pAttachments, uint32_t rectCount, const VkClearRect* pRects)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 2);
++    rp_real.vkCmdClearAttachments(commandBuffer, attachmentCount, pAttachments, rectCount, pRects);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image, VkImageLayout imageLayout, const VkClearColorValue* pColor, uint32_t rangeCount, const VkImageSubresourceRange* pRanges)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 3);
++    rp_real.vkCmdClearColorImage(commandBuffer, image, imageLayout, pColor, rangeCount, pRanges);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage image, VkImageLayout imageLayout, const VkClearDepthStencilValue* pDepthStencil, uint32_t rangeCount, const VkImageSubresourceRange* pRanges)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 4);
++    rp_real.vkCmdClearDepthStencilImage(commandBuffer, image, imageLayout, pDepthStencil, rangeCount, pRanges);
++}
++
++struct rp_op_vkCmdCopyQueryPoolResults
++{
++    struct rp_op h;
++    VkQueryPool queryPool;
++    uint32_t firstQuery;
++    uint32_t queryCount;
++    VkBuffer dstBuffer;
++    VkDeviceSize dstOffset;
++    VkDeviceSize stride;
++    VkQueryResultFlags flags;
++};
++
++static void rp_replay_vkCmdCopyQueryPoolResults(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdCopyQueryPoolResults *op = (const void *)h;
++    rp_real.vkCmdCopyQueryPoolResults(cb, op->queryPool, op->firstQuery, op->queryCount, op->dstBuffer, op->dstOffset, op->stride, op->flags);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount, VkBuffer dstBuffer, VkDeviceSize dstOffset, VkDeviceSize stride, VkQueryResultFlags flags)
++{
++    struct rp_op_vkCmdCopyQueryPoolResults *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdCopyQueryPoolResults(commandBuffer, queryPool, firstQuery, queryCount, dstBuffer, dstOffset, stride, flags);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdCopyQueryPoolResults, sizeof(*op));
++    op->queryPool = queryPool;
++    op->firstQuery = firstQuery;
++    op->queryCount = queryCount;
++    op->dstBuffer = dstBuffer;
++    op->dstOffset = dstOffset;
++    op->stride = stride;
++    op->flags = flags;
++}
++
++struct rp_op_vkCmdDispatch
++{
++    struct rp_op h;
++    uint32_t groupCountX;
++    uint32_t groupCountY;
++    uint32_t groupCountZ;
++};
++
++static void rp_replay_vkCmdDispatch(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDispatch *op = (const void *)h;
++    rp_real.vkCmdDispatch(cb, op->groupCountX, op->groupCountY, op->groupCountZ);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDispatch(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
++{
++    struct rp_op_vkCmdDispatch *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDispatch(commandBuffer, groupCountX, groupCountY, groupCountZ);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDispatch, sizeof(*op));
++    op->groupCountX = groupCountX;
++    op->groupCountY = groupCountY;
++    op->groupCountZ = groupCountZ;
++}
++
++struct rp_op_vkCmdDispatchIndirect
++{
++    struct rp_op h;
++    VkBuffer buffer;
++    VkDeviceSize offset;
++};
++
++static void rp_replay_vkCmdDispatchIndirect(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDispatchIndirect *op = (const void *)h;
++    rp_real.vkCmdDispatchIndirect(cb, op->buffer, op->offset);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset)
++{
++    struct rp_op_vkCmdDispatchIndirect *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDispatchIndirect(commandBuffer, buffer, offset);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDispatchIndirect, sizeof(*op));
++    op->buffer = buffer;
++    op->offset = offset;
++}
++
++struct rp_op_vkCmdDraw
++{
++    struct rp_op h;
++    uint32_t vertexCount;
++    uint32_t instanceCount;
++    uint32_t firstVertex;
++    uint32_t firstInstance;
++};
++
++static void rp_replay_vkCmdDraw(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDraw *op = (const void *)h;
++    rp_real.vkCmdDraw(cb, op->vertexCount, op->instanceCount, op->firstVertex, op->firstInstance);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
++{
++    struct rp_op_vkCmdDraw *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDraw(commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDraw, sizeof(*op));
++    op->vertexCount = vertexCount;
++    op->instanceCount = instanceCount;
++    op->firstVertex = firstVertex;
++    op->firstInstance = firstInstance;
++}
++
++struct rp_op_vkCmdDrawIndexed
++{
++    struct rp_op h;
++    uint32_t indexCount;
++    uint32_t instanceCount;
++    uint32_t firstIndex;
++    int32_t vertexOffset;
++    uint32_t firstInstance;
++};
++
++static void rp_replay_vkCmdDrawIndexed(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDrawIndexed *op = (const void *)h;
++    rp_real.vkCmdDrawIndexed(cb, op->indexCount, op->instanceCount, op->firstIndex, op->vertexOffset, op->firstInstance);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
++{
++    struct rp_op_vkCmdDrawIndexed *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDrawIndexed(commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDrawIndexed, sizeof(*op));
++    op->indexCount = indexCount;
++    op->instanceCount = instanceCount;
++    op->firstIndex = firstIndex;
++    op->vertexOffset = vertexOffset;
++    op->firstInstance = firstInstance;
++}
++
++struct rp_op_vkCmdDrawIndexedIndirect
++{
++    struct rp_op h;
++    VkBuffer buffer;
++    VkDeviceSize offset;
++    uint32_t drawCount;
++    uint32_t stride;
++};
++
++static void rp_replay_vkCmdDrawIndexedIndirect(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDrawIndexedIndirect *op = (const void *)h;
++    rp_real.vkCmdDrawIndexedIndirect(cb, op->buffer, op->offset, op->drawCount, op->stride);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
++{
++    struct rp_op_vkCmdDrawIndexedIndirect *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDrawIndexedIndirect(commandBuffer, buffer, offset, drawCount, stride);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDrawIndexedIndirect, sizeof(*op));
++    op->buffer = buffer;
++    op->offset = offset;
++    op->drawCount = drawCount;
++    op->stride = stride;
++}
++
++struct rp_op_vkCmdDrawIndexedIndirectCount
++{
++    struct rp_op h;
++    VkBuffer buffer;
++    VkDeviceSize offset;
++    VkBuffer countBuffer;
++    VkDeviceSize countBufferOffset;
++    uint32_t maxDrawCount;
++    uint32_t stride;
++};
++
++static void rp_replay_vkCmdDrawIndexedIndirectCount(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDrawIndexedIndirectCount *op = (const void *)h;
++    rp_real.vkCmdDrawIndexedIndirectCount(cb, op->buffer, op->offset, op->countBuffer, op->countBufferOffset, op->maxDrawCount, op->stride);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride)
++{
++    struct rp_op_vkCmdDrawIndexedIndirectCount *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDrawIndexedIndirectCount(commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDrawIndexedIndirectCount, sizeof(*op));
++    op->buffer = buffer;
++    op->offset = offset;
++    op->countBuffer = countBuffer;
++    op->countBufferOffset = countBufferOffset;
++    op->maxDrawCount = maxDrawCount;
++    op->stride = stride;
++}
++
++struct rp_op_vkCmdDrawIndirect
++{
++    struct rp_op h;
++    VkBuffer buffer;
++    VkDeviceSize offset;
++    uint32_t drawCount;
++    uint32_t stride;
++};
++
++static void rp_replay_vkCmdDrawIndirect(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDrawIndirect *op = (const void *)h;
++    rp_real.vkCmdDrawIndirect(cb, op->buffer, op->offset, op->drawCount, op->stride);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
++{
++    struct rp_op_vkCmdDrawIndirect *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDrawIndirect(commandBuffer, buffer, offset, drawCount, stride);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDrawIndirect, sizeof(*op));
++    op->buffer = buffer;
++    op->offset = offset;
++    op->drawCount = drawCount;
++    op->stride = stride;
++}
++
++struct rp_op_vkCmdDrawIndirectCount
++{
++    struct rp_op h;
++    VkBuffer buffer;
++    VkDeviceSize offset;
++    VkBuffer countBuffer;
++    VkDeviceSize countBufferOffset;
++    uint32_t maxDrawCount;
++    uint32_t stride;
++};
++
++static void rp_replay_vkCmdDrawIndirectCount(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDrawIndirectCount *op = (const void *)h;
++    rp_real.vkCmdDrawIndirectCount(cb, op->buffer, op->offset, op->countBuffer, op->countBufferOffset, op->maxDrawCount, op->stride);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride)
++{
++    struct rp_op_vkCmdDrawIndirectCount *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDrawIndirectCount(commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDrawIndirectCount, sizeof(*op));
++    op->buffer = buffer;
++    op->offset = offset;
++    op->countBuffer = countBuffer;
++    op->countBufferOffset = countBufferOffset;
++    op->maxDrawCount = maxDrawCount;
++    op->stride = stride;
++}
++
++struct rp_op_vkCmdEndQuery
++{
++    struct rp_op h;
++    VkQueryPool queryPool;
++    uint32_t query;
++};
++
++static void rp_replay_vkCmdEndQuery(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdEndQuery *op = (const void *)h;
++    rp_real.vkCmdEndQuery(cb, op->queryPool, op->query);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query)
++{
++    struct rp_op_vkCmdEndQuery *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdEndQuery(commandBuffer, queryPool, query);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdEndQuery, sizeof(*op));
++    op->queryPool = queryPool;
++    op->query = query;
++}
++
++struct rp_op_vkCmdEndRendering
++{
++    struct rp_op h;
++};
++
++static void rp_replay_vkCmdEndRendering(VkCommandBuffer cb, const struct rp_op *h)
++{
++    (void)h;
++    rp_real.vkCmdEndRendering(cb);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdEndRendering(VkCommandBuffer commandBuffer)
++{
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdEndRendering(commandBuffer);
++        return;
++    }
++    rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdEndRendering, sizeof(struct rp_op_vkCmdEndRendering));
++}
++
++struct rp_op_vkCmdFillBuffer
++{
++    struct rp_op h;
++    VkBuffer dstBuffer;
++    VkDeviceSize dstOffset;
++    VkDeviceSize size;
++    uint32_t data;
++};
++
++static void rp_replay_vkCmdFillBuffer(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdFillBuffer *op = (const void *)h;
++    rp_real.vkCmdFillBuffer(cb, op->dstBuffer, op->dstOffset, op->size, op->data);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDeviceSize dstOffset, VkDeviceSize size, uint32_t data)
++{
++    struct rp_op_vkCmdFillBuffer *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdFillBuffer(commandBuffer, dstBuffer, dstOffset, size, data);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdFillBuffer, sizeof(*op));
++    op->dstBuffer = dstBuffer;
++    op->dstOffset = dstOffset;
++    op->size = size;
++    op->data = data;
++}
++
++struct rp_op_vkCmdNextSubpass
++{
++    struct rp_op h;
++    VkSubpassContents contents;
++};
++
++static void rp_replay_vkCmdNextSubpass(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdNextSubpass *op = (const void *)h;
++    rp_real.vkCmdNextSubpass(cb, op->contents);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents)
++{
++    struct rp_op_vkCmdNextSubpass *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdNextSubpass(commandBuffer, contents);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdNextSubpass, sizeof(*op));
++    op->contents = contents;
++}
++
++struct rp_op_vkCmdResetEvent2
++{
++    struct rp_op h;
++    VkEvent event;
++    VkPipelineStageFlags2 stageMask;
++};
++
++static void rp_replay_vkCmdResetEvent2(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdResetEvent2 *op = (const void *)h;
++    rp_real.vkCmdResetEvent2(cb, op->event, op->stageMask);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags2 stageMask)
++{
++    struct rp_op_vkCmdResetEvent2 *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdResetEvent2(commandBuffer, event, stageMask);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdResetEvent2, sizeof(*op));
++    op->event = event;
++    op->stageMask = stageMask;
++}
++
++struct rp_op_vkCmdResetQueryPool
++{
++    struct rp_op h;
++    VkQueryPool queryPool;
++    uint32_t firstQuery;
++    uint32_t queryCount;
++};
++
++static void rp_replay_vkCmdResetQueryPool(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdResetQueryPool *op = (const void *)h;
++    rp_real.vkCmdResetQueryPool(cb, op->queryPool, op->firstQuery, op->queryCount);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount)
++{
++    struct rp_op_vkCmdResetQueryPool *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdResetQueryPool(commandBuffer, queryPool, firstQuery, queryCount);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdResetQueryPool, sizeof(*op));
++    op->queryPool = queryPool;
++    op->firstQuery = firstQuery;
++    op->queryCount = queryCount;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2* pResolveImageInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 5);
++    rp_real.vkCmdResolveImage2(commandBuffer, pResolveImageInfo);
++}
++
++struct rp_op_vkCmdSetDepthBias
++{
++    struct rp_op h;
++    float depthBiasConstantFactor;
++    float depthBiasClamp;
++    float depthBiasSlopeFactor;
++};
++
++static void rp_replay_vkCmdSetDepthBias(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetDepthBias *op = (const void *)h;
++    rp_real.vkCmdSetDepthBias(cb, op->depthBiasConstantFactor, op->depthBiasClamp, op->depthBiasSlopeFactor);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetDepthBias(VkCommandBuffer commandBuffer, float depthBiasConstantFactor, float depthBiasClamp, float depthBiasSlopeFactor)
++{
++    struct rp_op_vkCmdSetDepthBias *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetDepthBias(commandBuffer, depthBiasConstantFactor, depthBiasClamp, depthBiasSlopeFactor);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetDepthBias, sizeof(*op));
++    op->depthBiasConstantFactor = depthBiasConstantFactor;
++    op->depthBiasClamp = depthBiasClamp;
++    op->depthBiasSlopeFactor = depthBiasSlopeFactor;
++}
++
++struct rp_op_vkCmdSetDepthBiasEnable
++{
++    struct rp_op h;
++    VkBool32 depthBiasEnable;
++};
++
++static void rp_replay_vkCmdSetDepthBiasEnable(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetDepthBiasEnable *op = (const void *)h;
++    rp_real.vkCmdSetDepthBiasEnable(cb, op->depthBiasEnable);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetDepthBiasEnable(VkCommandBuffer commandBuffer, VkBool32 depthBiasEnable)
++{
++    struct rp_op_vkCmdSetDepthBiasEnable *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetDepthBiasEnable(commandBuffer, depthBiasEnable);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetDepthBiasEnable, sizeof(*op));
++    op->depthBiasEnable = depthBiasEnable;
++}
++
++struct rp_op_vkCmdSetDepthBounds
++{
++    struct rp_op h;
++    float minDepthBounds;
++    float maxDepthBounds;
++};
++
++static void rp_replay_vkCmdSetDepthBounds(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetDepthBounds *op = (const void *)h;
++    rp_real.vkCmdSetDepthBounds(cb, op->minDepthBounds, op->maxDepthBounds);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetDepthBounds(VkCommandBuffer commandBuffer, float minDepthBounds, float maxDepthBounds)
++{
++    struct rp_op_vkCmdSetDepthBounds *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetDepthBounds(commandBuffer, minDepthBounds, maxDepthBounds);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetDepthBounds, sizeof(*op));
++    op->minDepthBounds = minDepthBounds;
++    op->maxDepthBounds = maxDepthBounds;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent event, const VkDependencyInfo* pDependencyInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 6);
++    rp_real.vkCmdSetEvent2(commandBuffer, event, pDependencyInfo);
++}
++
++struct rp_op_vkCmdSetLineWidth
++{
++    struct rp_op h;
++    float lineWidth;
++};
++
++static void rp_replay_vkCmdSetLineWidth(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetLineWidth *op = (const void *)h;
++    rp_real.vkCmdSetLineWidth(cb, op->lineWidth);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetLineWidth(VkCommandBuffer commandBuffer, float lineWidth)
++{
++    struct rp_op_vkCmdSetLineWidth *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetLineWidth(commandBuffer, lineWidth);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetLineWidth, sizeof(*op));
++    op->lineWidth = lineWidth;
++}
++
++struct rp_op_vkCmdSetPrimitiveRestartEnable
++{
++    struct rp_op h;
++    VkBool32 primitiveRestartEnable;
++};
++
++static void rp_replay_vkCmdSetPrimitiveRestartEnable(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetPrimitiveRestartEnable *op = (const void *)h;
++    rp_real.vkCmdSetPrimitiveRestartEnable(cb, op->primitiveRestartEnable);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetPrimitiveRestartEnable(VkCommandBuffer commandBuffer, VkBool32 primitiveRestartEnable)
++{
++    struct rp_op_vkCmdSetPrimitiveRestartEnable *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetPrimitiveRestartEnable(commandBuffer, primitiveRestartEnable);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetPrimitiveRestartEnable, sizeof(*op));
++    op->primitiveRestartEnable = primitiveRestartEnable;
++}
++
++struct rp_op_vkCmdSetPrimitiveTopology
++{
++    struct rp_op h;
++    VkPrimitiveTopology primitiveTopology;
++};
++
++static void rp_replay_vkCmdSetPrimitiveTopology(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetPrimitiveTopology *op = (const void *)h;
++    rp_real.vkCmdSetPrimitiveTopology(cb, op->primitiveTopology);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetPrimitiveTopology(VkCommandBuffer commandBuffer, VkPrimitiveTopology primitiveTopology)
++{
++    struct rp_op_vkCmdSetPrimitiveTopology *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetPrimitiveTopology(commandBuffer, primitiveTopology);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetPrimitiveTopology, sizeof(*op));
++    op->primitiveTopology = primitiveTopology;
++}
++
++struct rp_op_vkCmdSetStencilCompareMask
++{
++    struct rp_op h;
++    VkStencilFaceFlags faceMask;
++    uint32_t compareMask;
++};
++
++static void rp_replay_vkCmdSetStencilCompareMask(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetStencilCompareMask *op = (const void *)h;
++    rp_real.vkCmdSetStencilCompareMask(cb, op->faceMask, op->compareMask);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetStencilCompareMask(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t compareMask)
++{
++    struct rp_op_vkCmdSetStencilCompareMask *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetStencilCompareMask(commandBuffer, faceMask, compareMask);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetStencilCompareMask, sizeof(*op));
++    op->faceMask = faceMask;
++    op->compareMask = compareMask;
++}
++
++struct rp_op_vkCmdSetStencilReference
++{
++    struct rp_op h;
++    VkStencilFaceFlags faceMask;
++    uint32_t reference;
++};
++
++static void rp_replay_vkCmdSetStencilReference(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetStencilReference *op = (const void *)h;
++    rp_real.vkCmdSetStencilReference(cb, op->faceMask, op->reference);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetStencilReference(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t reference)
++{
++    struct rp_op_vkCmdSetStencilReference *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetStencilReference(commandBuffer, faceMask, reference);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetStencilReference, sizeof(*op));
++    op->faceMask = faceMask;
++    op->reference = reference;
++}
++
++struct rp_op_vkCmdSetStencilWriteMask
++{
++    struct rp_op h;
++    VkStencilFaceFlags faceMask;
++    uint32_t writeMask;
++};
++
++static void rp_replay_vkCmdSetStencilWriteMask(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetStencilWriteMask *op = (const void *)h;
++    rp_real.vkCmdSetStencilWriteMask(cb, op->faceMask, op->writeMask);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetStencilWriteMask(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t writeMask)
++{
++    struct rp_op_vkCmdSetStencilWriteMask *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetStencilWriteMask(commandBuffer, faceMask, writeMask);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetStencilWriteMask, sizeof(*op));
++    op->faceMask = faceMask;
++    op->writeMask = writeMask;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkEvent* pEvents, const VkDependencyInfo* pDependencyInfos)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 7);
++    rp_real.vkCmdWaitEvents2(commandBuffer, eventCount, pEvents, pDependencyInfos);
++}
++
++struct rp_op_vkCmdWriteTimestamp2
++{
++    struct rp_op h;
++    VkPipelineStageFlags2 stage;
++    VkQueryPool queryPool;
++    uint32_t query;
++};
++
++static void rp_replay_vkCmdWriteTimestamp2(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdWriteTimestamp2 *op = (const void *)h;
++    rp_real.vkCmdWriteTimestamp2(cb, op->stage, op->queryPool, op->query);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stage, VkQueryPool queryPool, uint32_t query)
++{
++    struct rp_op_vkCmdWriteTimestamp2 *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdWriteTimestamp2(commandBuffer, stage, queryPool, query);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdWriteTimestamp2, sizeof(*op));
++    op->stage = stage;
++    op->queryPool = queryPool;
++    op->query = query;
++}
++
++struct rp_op_vkDestroyBuffer
++{
++    struct rp_op h;
++    VkDevice device;
++    VkBuffer buffer;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyBuffer(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyBuffer *op = (const void *)h;
++    rp_real.vkDestroyBuffer(op->device, op->buffer, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyBuffer *op;
++    struct rp_chunk *k;
++
++    if (!buffer || !(k = rp_defer_chunk(rp_replay_vkDestroyBuffer, sizeof(*op))))
++    {
++        rp_real.vkDestroyBuffer(device, buffer, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->buffer = buffer;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroyBufferView
++{
++    struct rp_op h;
++    VkDevice device;
++    VkBufferView bufferView;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyBufferView(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyBufferView *op = (const void *)h;
++    rp_real.vkDestroyBufferView(op->device, op->bufferView, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyBufferView(VkDevice device, VkBufferView bufferView, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyBufferView *op;
++    struct rp_chunk *k;
++
++    if (!bufferView || !(k = rp_defer_chunk(rp_replay_vkDestroyBufferView, sizeof(*op))))
++    {
++        rp_real.vkDestroyBufferView(device, bufferView, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->bufferView = bufferView;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroyDescriptorPool
++{
++    struct rp_op h;
++    VkDevice device;
++    VkDescriptorPool descriptorPool;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyDescriptorPool(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyDescriptorPool *op = (const void *)h;
++    rp_real.vkDestroyDescriptorPool(op->device, op->descriptorPool, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyDescriptorPool *op;
++    struct rp_chunk *k;
++
++    if (!descriptorPool || !(k = rp_defer_chunk(rp_replay_vkDestroyDescriptorPool, sizeof(*op))))
++    {
++        rp_real.vkDestroyDescriptorPool(device, descriptorPool, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->descriptorPool = descriptorPool;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroyDescriptorSetLayout
++{
++    struct rp_op h;
++    VkDevice device;
++    VkDescriptorSetLayout descriptorSetLayout;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyDescriptorSetLayout(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyDescriptorSetLayout *op = (const void *)h;
++    rp_real.vkDestroyDescriptorSetLayout(op->device, op->descriptorSetLayout, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout descriptorSetLayout, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyDescriptorSetLayout *op;
++    struct rp_chunk *k;
++
++    if (!descriptorSetLayout || !(k = rp_defer_chunk(rp_replay_vkDestroyDescriptorSetLayout, sizeof(*op))))
++    {
++        rp_real.vkDestroyDescriptorSetLayout(device, descriptorSetLayout, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->descriptorSetLayout = descriptorSetLayout;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroyEvent
++{
++    struct rp_op h;
++    VkDevice device;
++    VkEvent event;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyEvent(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyEvent *op = (const void *)h;
++    rp_real.vkDestroyEvent(op->device, op->event, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyEvent(VkDevice device, VkEvent event, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyEvent *op;
++    struct rp_chunk *k;
++
++    if (!event || !(k = rp_defer_chunk(rp_replay_vkDestroyEvent, sizeof(*op))))
++    {
++        rp_real.vkDestroyEvent(device, event, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->event = event;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* pAllocator)
++{
++    rp_guard();
++    rp_real.vkDestroyFence(device, fence, pAllocator);
++}
++
++struct rp_op_vkDestroyFramebuffer
++{
++    struct rp_op h;
++    VkDevice device;
++    VkFramebuffer framebuffer;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyFramebuffer(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyFramebuffer *op = (const void *)h;
++    rp_real.vkDestroyFramebuffer(op->device, op->framebuffer, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyFramebuffer *op;
++    struct rp_chunk *k;
++
++    if (!framebuffer || !(k = rp_defer_chunk(rp_replay_vkDestroyFramebuffer, sizeof(*op))))
++    {
++        rp_real.vkDestroyFramebuffer(device, framebuffer, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->framebuffer = framebuffer;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroyImage
++{
++    struct rp_op h;
++    VkDevice device;
++    VkImage image;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyImage(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyImage *op = (const void *)h;
++    rp_real.vkDestroyImage(op->device, op->image, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyImage *op;
++    struct rp_chunk *k;
++
++    if (!image || !(k = rp_defer_chunk(rp_replay_vkDestroyImage, sizeof(*op))))
++    {
++        rp_real.vkDestroyImage(device, image, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->image = image;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroyImageView
++{
++    struct rp_op h;
++    VkDevice device;
++    VkImageView imageView;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyImageView(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyImageView *op = (const void *)h;
++    rp_real.vkDestroyImageView(op->device, op->imageView, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyImageView(VkDevice device, VkImageView imageView, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyImageView *op;
++    struct rp_chunk *k;
++
++    if (!imageView || !(k = rp_defer_chunk(rp_replay_vkDestroyImageView, sizeof(*op))))
++    {
++        rp_real.vkDestroyImageView(device, imageView, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->imageView = imageView;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroyPipeline
++{
++    struct rp_op h;
++    VkDevice device;
++    VkPipeline pipeline;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyPipeline(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyPipeline *op = (const void *)h;
++    rp_real.vkDestroyPipeline(op->device, op->pipeline, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyPipeline *op;
++    struct rp_chunk *k;
++
++    if (!pipeline || !(k = rp_defer_chunk(rp_replay_vkDestroyPipeline, sizeof(*op))))
++    {
++        rp_real.vkDestroyPipeline(device, pipeline, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->pipeline = pipeline;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyPipelineCache(VkDevice device, VkPipelineCache pipelineCache, const VkAllocationCallbacks* pAllocator)
++{
++    rp_guard();
++    rp_real.vkDestroyPipelineCache(device, pipelineCache, pAllocator);
++}
++
++struct rp_op_vkDestroyPipelineLayout
++{
++    struct rp_op h;
++    VkDevice device;
++    VkPipelineLayout pipelineLayout;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyPipelineLayout(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyPipelineLayout *op = (const void *)h;
++    rp_real.vkDestroyPipelineLayout(op->device, op->pipelineLayout, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyPipelineLayout(VkDevice device, VkPipelineLayout pipelineLayout, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyPipelineLayout *op;
++    struct rp_chunk *k;
++
++    if (!pipelineLayout || !(k = rp_defer_chunk(rp_replay_vkDestroyPipelineLayout, sizeof(*op))))
++    {
++        rp_real.vkDestroyPipelineLayout(device, pipelineLayout, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->pipelineLayout = pipelineLayout;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroyQueryPool
++{
++    struct rp_op h;
++    VkDevice device;
++    VkQueryPool queryPool;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyQueryPool(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyQueryPool *op = (const void *)h;
++    rp_real.vkDestroyQueryPool(op->device, op->queryPool, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyQueryPool(VkDevice device, VkQueryPool queryPool, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyQueryPool *op;
++    struct rp_chunk *k;
++
++    if (!queryPool || !(k = rp_defer_chunk(rp_replay_vkDestroyQueryPool, sizeof(*op))))
++    {
++        rp_real.vkDestroyQueryPool(device, queryPool, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->queryPool = queryPool;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroySampler
++{
++    struct rp_op h;
++    VkDevice device;
++    VkSampler sampler;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroySampler(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroySampler *op = (const void *)h;
++    rp_real.vkDestroySampler(op->device, op->sampler, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroySampler(VkDevice device, VkSampler sampler, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroySampler *op;
++    struct rp_chunk *k;
++
++    if (!sampler || !(k = rp_defer_chunk(rp_replay_vkDestroySampler, sizeof(*op))))
++    {
++        rp_real.vkDestroySampler(device, sampler, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->sampler = sampler;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroySemaphore(VkDevice device, VkSemaphore semaphore, const VkAllocationCallbacks* pAllocator)
++{
++    rp_guard();
++    rp_real.vkDestroySemaphore(device, semaphore, pAllocator);
++}
++
++struct rp_op_vkDestroyShaderModule
++{
++    struct rp_op h;
++    VkDevice device;
++    VkShaderModule shaderModule;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyShaderModule(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyShaderModule *op = (const void *)h;
++    rp_real.vkDestroyShaderModule(op->device, op->shaderModule, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyShaderModule(VkDevice device, VkShaderModule shaderModule, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyShaderModule *op;
++    struct rp_chunk *k;
++
++    if (!shaderModule || !(k = rp_defer_chunk(rp_replay_vkDestroyShaderModule, sizeof(*op))))
++    {
++        rp_real.vkDestroyShaderModule(device, shaderModule, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->shaderModule = shaderModule;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL rp_vkFreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool, uint32_t descriptorSetCount, const VkDescriptorSet* pDescriptorSets)
++{
++    rp_guard();
++    return rp_real.vkFreeDescriptorSets(device, descriptorPool, descriptorSetCount, pDescriptorSets);
++}
++
++struct rp_op_vkFreeMemory
++{
++    struct rp_op h;
++    VkDevice device;
++    VkDeviceMemory memory;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkFreeMemory(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkFreeMemory *op = (const void *)h;
++    rp_real.vkFreeMemory(op->device, op->memory, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkFreeMemory *op;
++    struct rp_chunk *k;
++
++    if (!memory || !(k = rp_defer_chunk(rp_replay_vkFreeMemory, sizeof(*op))))
++    {
++        rp_real.vkFreeMemory(device, memory, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->memory = memory;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++static VKAPI_ATTR VkResult VKAPI_CALL rp_vkResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, VkDescriptorPoolResetFlags flags)
++{
++    rp_guard();
++    return rp_real.vkResetDescriptorPool(device, descriptorPool, flags);
++}
++
++struct rp_op_vkCmdSetDepthWriteEnable
++{
++    struct rp_op h;
++    VkBool32 depthWriteEnable;
++};
++
++static void rp_replay_vkCmdSetDepthWriteEnable(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetDepthWriteEnable *op = (const void *)h;
++    rp_real.vkCmdSetDepthWriteEnable(cb, op->depthWriteEnable);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetDepthWriteEnable(VkCommandBuffer commandBuffer, VkBool32 depthWriteEnable)
++{
++    struct rp_op_vkCmdSetDepthWriteEnable *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetDepthWriteEnable(commandBuffer, depthWriteEnable);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetDepthWriteEnable, sizeof(*op));
++    op->depthWriteEnable = depthWriteEnable;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout, VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount, const VkImageBlit* pRegions, VkFilter filter)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 8);
++    rp_real.vkCmdBlitImage(commandBuffer, srcImage, srcImageLayout, dstImage, dstImageLayout, regionCount, pRegions, filter);
++}
++
++struct rp_op_vkCmdSetRayTracingPipelineStackSizeKHR
++{
++    struct rp_op h;
++    uint32_t pipelineStackSize;
++};
++
++static void rp_replay_vkCmdSetRayTracingPipelineStackSizeKHR(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetRayTracingPipelineStackSizeKHR *op = (const void *)h;
++    rp_real.vkCmdSetRayTracingPipelineStackSizeKHR(cb, op->pipelineStackSize);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetRayTracingPipelineStackSizeKHR(VkCommandBuffer commandBuffer, uint32_t pipelineStackSize)
++{
++    struct rp_op_vkCmdSetRayTracingPipelineStackSizeKHR *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetRayTracingPipelineStackSizeKHR(commandBuffer, pipelineStackSize);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetRayTracingPipelineStackSizeKHR, sizeof(*op));
++    op->pipelineStackSize = pipelineStackSize;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdTraceRaysKHR(VkCommandBuffer commandBuffer, const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable, uint32_t width, uint32_t height, uint32_t depth)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 9);
++    rp_real.vkCmdTraceRaysKHR(commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable, width, height, depth);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdTraceRaysIndirectKHR(VkCommandBuffer commandBuffer, const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable, VkDeviceAddress indirectDeviceAddress)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 10);
++    rp_real.vkCmdTraceRaysIndirectKHR(commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable, indirectDeviceAddress);
++}
++
++struct rp_op_vkDestroyAccelerationStructureKHR
++{
++    struct rp_op h;
++    VkDevice device;
++    VkAccelerationStructureKHR accelerationStructure;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyAccelerationStructureKHR(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyAccelerationStructureKHR *op = (const void *)h;
++    rp_real.vkDestroyAccelerationStructureKHR(op->device, op->accelerationStructure, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR accelerationStructure, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyAccelerationStructureKHR *op;
++    struct rp_chunk *k;
++
++    if (!accelerationStructure || !(k = rp_defer_chunk(rp_replay_vkDestroyAccelerationStructureKHR, sizeof(*op))))
++    {
++        rp_real.vkDestroyAccelerationStructureKHR(device, accelerationStructure, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->accelerationStructure = accelerationStructure;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t infoCount, const VkAccelerationStructureBuildGeometryInfoKHR* pInfos, const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 11);
++    rp_real.vkCmdBuildAccelerationStructuresKHR(commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdWriteAccelerationStructuresPropertiesKHR(VkCommandBuffer commandBuffer, uint32_t accelerationStructureCount, const VkAccelerationStructureKHR* pAccelerationStructures, VkQueryType queryType, VkQueryPool queryPool, uint32_t firstQuery)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 12);
++    rp_real.vkCmdWriteAccelerationStructuresPropertiesKHR(commandBuffer, accelerationStructureCount, pAccelerationStructures, queryType, queryPool, firstQuery);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdCopyAccelerationStructureKHR(VkCommandBuffer commandBuffer, const VkCopyAccelerationStructureInfoKHR* pInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 13);
++    rp_real.vkCmdCopyAccelerationStructureKHR(commandBuffer, pInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetFragmentShadingRateKHR(VkCommandBuffer commandBuffer, const VkExtent2D* pFragmentSize, const VkFragmentShadingRateCombinerOpKHR combinerOps[2])
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 14);
++    rp_real.vkCmdSetFragmentShadingRateKHR(commandBuffer, pFragmentSize, combinerOps);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBeginConditionalRendering2EXT(VkCommandBuffer commandBuffer, const VkConditionalRenderingBeginInfo2EXT* pConditionalRenderingBegin)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 15);
++    rp_real.vkCmdBeginConditionalRendering2EXT(commandBuffer, pConditionalRenderingBegin);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBeginTransformFeedback2EXT(VkCommandBuffer commandBuffer, uint32_t firstCounterRange, uint32_t counterRangeCount, const VkBindTransformFeedbackBuffer2InfoEXT* pCounterInfos)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 16);
++    rp_real.vkCmdBeginTransformFeedback2EXT(commandBuffer, firstCounterRange, counterRangeCount, pCounterInfos);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindIndexBuffer3KHR(VkCommandBuffer commandBuffer, const VkBindIndexBuffer3InfoKHR* pInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 17);
++    rp_real.vkCmdBindIndexBuffer3KHR(commandBuffer, pInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindTransformFeedbackBuffers2EXT(VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount, const VkBindTransformFeedbackBuffer2InfoEXT* pBindingInfos)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 18);
++    rp_real.vkCmdBindTransformFeedbackBuffers2EXT(commandBuffer, firstBinding, bindingCount, pBindingInfos);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindVertexBuffers3KHR(VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount, const VkBindVertexBuffer3InfoKHR* pBindingInfos)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 19);
++    rp_real.vkCmdBindVertexBuffers3KHR(commandBuffer, firstBinding, bindingCount, pBindingInfos);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdCopyImageToMemoryKHR(VkCommandBuffer commandBuffer, const VkCopyDeviceMemoryImageInfoKHR* pCopyMemoryInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 20);
++    rp_real.vkCmdCopyImageToMemoryKHR(commandBuffer, pCopyMemoryInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdCopyMemoryKHR(VkCommandBuffer commandBuffer, const VkCopyDeviceMemoryInfoKHR* pCopyMemoryInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 21);
++    rp_real.vkCmdCopyMemoryKHR(commandBuffer, pCopyMemoryInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdCopyMemoryToImageKHR(VkCommandBuffer commandBuffer, const VkCopyDeviceMemoryImageInfoKHR* pCopyMemoryInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 22);
++    rp_real.vkCmdCopyMemoryToImageKHR(commandBuffer, pCopyMemoryInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdCopyQueryPoolResultsToMemoryKHR(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount, const VkStridedDeviceAddressRangeKHR* pDstRange, VkAddressCommandFlagsKHR dstFlags, VkQueryResultFlags queryResultFlags)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 23);
++    rp_real.vkCmdCopyQueryPoolResultsToMemoryKHR(commandBuffer, queryPool, firstQuery, queryCount, pDstRange, dstFlags, queryResultFlags);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer, const VkDispatchIndirect2InfoKHR* pInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 24);
++    rp_real.vkCmdDispatchIndirect2KHR(commandBuffer, pInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer, const VkDrawIndirect2InfoKHR* pInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 25);
++    rp_real.vkCmdDrawIndexedIndirect2KHR(commandBuffer, pInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer, const VkDrawIndirectCount2InfoKHR* pInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 26);
++    rp_real.vkCmdDrawIndexedIndirectCount2KHR(commandBuffer, pInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawIndirect2KHR(VkCommandBuffer commandBuffer, const VkDrawIndirect2InfoKHR* pInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 27);
++    rp_real.vkCmdDrawIndirect2KHR(commandBuffer, pInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawIndirectByteCount2EXT(VkCommandBuffer commandBuffer, uint32_t instanceCount, uint32_t firstInstance, const VkBindTransformFeedbackBuffer2InfoEXT* pCounterInfo, uint32_t counterOffset, uint32_t vertexStride)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 28);
++    rp_real.vkCmdDrawIndirectByteCount2EXT(commandBuffer, instanceCount, firstInstance, pCounterInfo, counterOffset, vertexStride);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawIndirectCount2KHR(VkCommandBuffer commandBuffer, const VkDrawIndirectCount2InfoKHR* pInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 29);
++    rp_real.vkCmdDrawIndirectCount2KHR(commandBuffer, pInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawMeshTasksIndirect2EXT(VkCommandBuffer commandBuffer, const VkDrawIndirect2InfoKHR* pInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 30);
++    rp_real.vkCmdDrawMeshTasksIndirect2EXT(commandBuffer, pInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawMeshTasksIndirectCount2EXT(VkCommandBuffer commandBuffer, const VkDrawIndirectCount2InfoKHR* pInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 31);
++    rp_real.vkCmdDrawMeshTasksIndirectCount2EXT(commandBuffer, pInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdEndTransformFeedback2EXT(VkCommandBuffer commandBuffer, uint32_t firstCounterRange, uint32_t counterRangeCount, const VkBindTransformFeedbackBuffer2InfoEXT* pCounterInfos)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 32);
++    rp_real.vkCmdEndTransformFeedback2EXT(commandBuffer, firstCounterRange, counterRangeCount, pCounterInfos);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdFillMemoryKHR(VkCommandBuffer commandBuffer, const VkDeviceAddressRangeKHR* pDstRange, VkAddressCommandFlagsKHR dstFlags, uint32_t data)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 33);
++    rp_real.vkCmdFillMemoryKHR(commandBuffer, pDstRange, dstFlags, data);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdUpdateMemoryKHR(VkCommandBuffer commandBuffer, const VkDeviceAddressRangeKHR* pDstRange, VkAddressCommandFlagsKHR dstFlags, VkDeviceSize dataSize, const void* pData)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 34);
++    rp_real.vkCmdUpdateMemoryKHR(commandBuffer, pDstRange, dstFlags, dataSize, pData);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdWriteMarkerToMemoryAMD(VkCommandBuffer commandBuffer, const VkMemoryMarkerInfoAMD* pInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 35);
++    rp_real.vkCmdWriteMarkerToMemoryAMD(commandBuffer, pInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer, const VkConditionalRenderingBeginInfoEXT* pConditionalRenderingBegin)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 36);
++    rp_real.vkCmdBeginConditionalRenderingEXT(commandBuffer, pConditionalRenderingBegin);
++}
++
++struct rp_op_vkCmdEndConditionalRenderingEXT
++{
++    struct rp_op h;
++};
++
++static void rp_replay_vkCmdEndConditionalRenderingEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    (void)h;
++    rp_real.vkCmdEndConditionalRenderingEXT(cb);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdEndConditionalRenderingEXT(VkCommandBuffer commandBuffer)
++{
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdEndConditionalRenderingEXT(commandBuffer);
++        return;
++    }
++    rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdEndConditionalRenderingEXT, sizeof(struct rp_op_vkCmdEndConditionalRenderingEXT));
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBeginDebugUtilsLabelEXT(VkCommandBuffer commandBuffer, const VkDebugUtilsLabelEXT* pLabelInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 37);
++    rp_real.vkCmdBeginDebugUtilsLabelEXT(commandBuffer, pLabelInfo);
++}
++
++struct rp_op_vkCmdEndDebugUtilsLabelEXT
++{
++    struct rp_op h;
++};
++
++static void rp_replay_vkCmdEndDebugUtilsLabelEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    (void)h;
++    rp_real.vkCmdEndDebugUtilsLabelEXT(cb);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdEndDebugUtilsLabelEXT(VkCommandBuffer commandBuffer)
++{
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdEndDebugUtilsLabelEXT(commandBuffer);
++        return;
++    }
++    rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdEndDebugUtilsLabelEXT, sizeof(struct rp_op_vkCmdEndDebugUtilsLabelEXT));
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdInsertDebugUtilsLabelEXT(VkCommandBuffer commandBuffer, const VkDebugUtilsLabelEXT* pLabelInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 38);
++    rp_real.vkCmdInsertDebugUtilsLabelEXT(commandBuffer, pLabelInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetDepthBias2EXT(VkCommandBuffer commandBuffer, const VkDepthBiasInfoEXT* pDepthBiasInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 39);
++    rp_real.vkCmdSetDepthBias2EXT(commandBuffer, pDepthBiasInfo);
++}
++
++struct rp_op_vkCmdBeginQueryIndexedEXT
++{
++    struct rp_op h;
++    VkQueryPool queryPool;
++    uint32_t query;
++    VkQueryControlFlags flags;
++    uint32_t index;
++};
++
++static void rp_replay_vkCmdBeginQueryIndexedEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdBeginQueryIndexedEXT *op = (const void *)h;
++    rp_real.vkCmdBeginQueryIndexedEXT(cb, op->queryPool, op->query, op->flags, op->index);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query, VkQueryControlFlags flags, uint32_t index)
++{
++    struct rp_op_vkCmdBeginQueryIndexedEXT *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdBeginQueryIndexedEXT(commandBuffer, queryPool, query, flags, index);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdBeginQueryIndexedEXT, sizeof(*op));
++    op->queryPool = queryPool;
++    op->query = query;
++    op->flags = flags;
++    op->index = index;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer, uint32_t counterBufferCount, const VkBuffer* pCounterBuffers, const VkDeviceSize* pCounterBufferOffsets)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 40);
++    rp_real.vkCmdBeginTransformFeedbackEXT(commandBuffer, firstCounterBuffer, counterBufferCount, pCounterBuffers, pCounterBufferOffsets);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount, const VkBuffer* pBuffers, const VkDeviceSize* pOffsets, const VkDeviceSize* pSizes)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 41);
++    rp_real.vkCmdBindTransformFeedbackBuffersEXT(commandBuffer, firstBinding, bindingCount, pBuffers, pOffsets, pSizes);
++}
++
++struct rp_op_vkCmdEndQueryIndexedEXT
++{
++    struct rp_op h;
++    VkQueryPool queryPool;
++    uint32_t query;
++    uint32_t index;
++};
++
++static void rp_replay_vkCmdEndQueryIndexedEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdEndQueryIndexedEXT *op = (const void *)h;
++    rp_real.vkCmdEndQueryIndexedEXT(cb, op->queryPool, op->query, op->index);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query, uint32_t index)
++{
++    struct rp_op_vkCmdEndQueryIndexedEXT *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdEndQueryIndexedEXT(commandBuffer, queryPool, query, index);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdEndQueryIndexedEXT, sizeof(*op));
++    op->queryPool = queryPool;
++    op->query = query;
++    op->index = index;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer, uint32_t counterBufferCount, const VkBuffer* pCounterBuffers, const VkDeviceSize* pCounterBufferOffsets)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 42);
++    rp_real.vkCmdEndTransformFeedbackEXT(commandBuffer, firstCounterBuffer, counterBufferCount, pCounterBuffers, pCounterBufferOffsets);
++}
++
++struct rp_op_vkCmdSetPatchControlPointsEXT
++{
++    struct rp_op h;
++    uint32_t patchControlPoints;
++};
++
++static void rp_replay_vkCmdSetPatchControlPointsEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetPatchControlPointsEXT *op = (const void *)h;
++    rp_real.vkCmdSetPatchControlPointsEXT(cb, op->patchControlPoints);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetPatchControlPointsEXT(VkCommandBuffer commandBuffer, uint32_t patchControlPoints)
++{
++    struct rp_op_vkCmdSetPatchControlPointsEXT *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetPatchControlPointsEXT(commandBuffer, patchControlPoints);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetPatchControlPointsEXT, sizeof(*op));
++    op->patchControlPoints = patchControlPoints;
++}
++
++struct rp_op_vkCmdSetRasterizationSamplesEXT
++{
++    struct rp_op h;
++    VkSampleCountFlagBits rasterizationSamples;
++};
++
++static void rp_replay_vkCmdSetRasterizationSamplesEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdSetRasterizationSamplesEXT *op = (const void *)h;
++    rp_real.vkCmdSetRasterizationSamplesEXT(cb, op->rasterizationSamples);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetRasterizationSamplesEXT(VkCommandBuffer commandBuffer, VkSampleCountFlagBits rasterizationSamples)
++{
++    struct rp_op_vkCmdSetRasterizationSamplesEXT *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdSetRasterizationSamplesEXT(commandBuffer, rasterizationSamples);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdSetRasterizationSamplesEXT, sizeof(*op));
++    op->rasterizationSamples = rasterizationSamples;
++}
++
++struct rp_op_vkCmdDrawMeshTasksEXT
++{
++    struct rp_op h;
++    uint32_t groupCountX;
++    uint32_t groupCountY;
++    uint32_t groupCountZ;
++};
++
++static void rp_replay_vkCmdDrawMeshTasksEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDrawMeshTasksEXT *op = (const void *)h;
++    rp_real.vkCmdDrawMeshTasksEXT(cb, op->groupCountX, op->groupCountY, op->groupCountZ);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
++{
++    struct rp_op_vkCmdDrawMeshTasksEXT *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDrawMeshTasksEXT(commandBuffer, groupCountX, groupCountY, groupCountZ);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDrawMeshTasksEXT, sizeof(*op));
++    op->groupCountX = groupCountX;
++    op->groupCountY = groupCountY;
++    op->groupCountZ = groupCountZ;
++}
++
++struct rp_op_vkCmdDrawMeshTasksIndirectEXT
++{
++    struct rp_op h;
++    VkBuffer buffer;
++    VkDeviceSize offset;
++    uint32_t drawCount;
++    uint32_t stride;
++};
++
++static void rp_replay_vkCmdDrawMeshTasksIndirectEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDrawMeshTasksIndirectEXT *op = (const void *)h;
++    rp_real.vkCmdDrawMeshTasksIndirectEXT(cb, op->buffer, op->offset, op->drawCount, op->stride);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
++{
++    struct rp_op_vkCmdDrawMeshTasksIndirectEXT *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDrawMeshTasksIndirectEXT(commandBuffer, buffer, offset, drawCount, stride);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDrawMeshTasksIndirectEXT, sizeof(*op));
++    op->buffer = buffer;
++    op->offset = offset;
++    op->drawCount = drawCount;
++    op->stride = stride;
++}
++
++struct rp_op_vkCmdDrawMeshTasksIndirectCountEXT
++{
++    struct rp_op h;
++    VkBuffer buffer;
++    VkDeviceSize offset;
++    VkBuffer countBuffer;
++    VkDeviceSize countBufferOffset;
++    uint32_t maxDrawCount;
++    uint32_t stride;
++};
++
++static void rp_replay_vkCmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDrawMeshTasksIndirectCountEXT *op = (const void *)h;
++    rp_real.vkCmdDrawMeshTasksIndirectCountEXT(cb, op->buffer, op->offset, op->countBuffer, op->countBufferOffset, op->maxDrawCount, op->stride);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride)
++{
++    struct rp_op_vkCmdDrawMeshTasksIndirectCountEXT *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDrawMeshTasksIndirectCountEXT(commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDrawMeshTasksIndirectCountEXT, sizeof(*op));
++    op->buffer = buffer;
++    op->offset = offset;
++    op->countBuffer = countBuffer;
++    op->countBufferOffset = countBufferOffset;
++    op->maxDrawCount = maxDrawCount;
++    op->stride = stride;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAllocator)
++{
++    rp_guard();
++    rp_real.vkDestroySwapchainKHR(device, swapchain, pAllocator);
++}
++
++struct rp_op_vkCmdTraceRaysIndirect2KHR
++{
++    struct rp_op h;
++    VkDeviceAddress indirectDeviceAddress;
++};
++
++static void rp_replay_vkCmdTraceRaysIndirect2KHR(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdTraceRaysIndirect2KHR *op = (const void *)h;
++    rp_real.vkCmdTraceRaysIndirect2KHR(cb, op->indirectDeviceAddress);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer, VkDeviceAddress indirectDeviceAddress)
++{
++    struct rp_op_vkCmdTraceRaysIndirect2KHR *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdTraceRaysIndirect2KHR(commandBuffer, indirectDeviceAddress);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdTraceRaysIndirect2KHR, sizeof(*op));
++    op->indirectDeviceAddress = indirectDeviceAddress;
++}
++
++struct rp_op_vkCmdBindIndexBuffer2KHR
++{
++    struct rp_op h;
++    VkBuffer buffer;
++    VkDeviceSize offset;
++    VkDeviceSize size;
++    VkIndexType indexType;
++};
++
++static void rp_replay_vkCmdBindIndexBuffer2KHR(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdBindIndexBuffer2KHR *op = (const void *)h;
++    rp_real.vkCmdBindIndexBuffer2KHR(cb, op->buffer, op->offset, op->size, op->indexType);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, VkIndexType indexType)
++{
++    struct rp_op_vkCmdBindIndexBuffer2KHR *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdBindIndexBuffer2KHR(commandBuffer, buffer, offset, size, indexType);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdBindIndexBuffer2KHR, sizeof(*op));
++    op->buffer = buffer;
++    op->offset = offset;
++    op->size = size;
++    op->indexType = indexType;
++}
++
++struct rp_op_vkCmdWriteBufferMarkerAMD
++{
++    struct rp_op h;
++    VkPipelineStageFlagBits pipelineStage;
++    VkBuffer dstBuffer;
++    VkDeviceSize dstOffset;
++    uint32_t marker;
++};
++
++static void rp_replay_vkCmdWriteBufferMarkerAMD(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdWriteBufferMarkerAMD *op = (const void *)h;
++    rp_real.vkCmdWriteBufferMarkerAMD(cb, op->pipelineStage, op->dstBuffer, op->dstOffset, op->marker);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdWriteBufferMarkerAMD(VkCommandBuffer commandBuffer, VkPipelineStageFlagBits pipelineStage, VkBuffer dstBuffer, VkDeviceSize dstOffset, uint32_t marker)
++{
++    struct rp_op_vkCmdWriteBufferMarkerAMD *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdWriteBufferMarkerAMD(commandBuffer, pipelineStage, dstBuffer, dstOffset, marker);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdWriteBufferMarkerAMD, sizeof(*op));
++    op->pipelineStage = pipelineStage;
++    op->dstBuffer = dstBuffer;
++    op->dstOffset = dstOffset;
++    op->marker = marker;
++}
++
++struct rp_op_vkCmdWriteBufferMarker2AMD
++{
++    struct rp_op h;
++    VkPipelineStageFlags2 stage;
++    VkBuffer dstBuffer;
++    VkDeviceSize dstOffset;
++    uint32_t marker;
++};
++
++static void rp_replay_vkCmdWriteBufferMarker2AMD(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdWriteBufferMarker2AMD *op = (const void *)h;
++    rp_real.vkCmdWriteBufferMarker2AMD(cb, op->stage, op->dstBuffer, op->dstOffset, op->marker);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stage, VkBuffer dstBuffer, VkDeviceSize dstOffset, uint32_t marker)
++{
++    struct rp_op_vkCmdWriteBufferMarker2AMD *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdWriteBufferMarker2AMD(commandBuffer, stage, dstBuffer, dstOffset, marker);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdWriteBufferMarker2AMD, sizeof(*op));
++    op->stage = stage;
++    op->dstBuffer = dstBuffer;
++    op->dstOffset = dstOffset;
++    op->marker = marker;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetCheckpointNV(VkCommandBuffer commandBuffer, const void* pCheckpointMarker)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 43);
++    rp_real.vkCmdSetCheckpointNV(commandBuffer, pCheckpointMarker);
++}
++
++struct rp_op_vkDestroyCuModuleNVX
++{
++    struct rp_op h;
++    VkDevice device;
++    VkCuModuleNVX module;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyCuModuleNVX(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyCuModuleNVX *op = (const void *)h;
++    rp_real.vkDestroyCuModuleNVX(op->device, op->module, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyCuModuleNVX(VkDevice device, VkCuModuleNVX module, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyCuModuleNVX *op;
++    struct rp_chunk *k;
++
++    if (!module || !(k = rp_defer_chunk(rp_replay_vkDestroyCuModuleNVX, sizeof(*op))))
++    {
++        rp_real.vkDestroyCuModuleNVX(device, module, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->module = module;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroyCuFunctionNVX
++{
++    struct rp_op h;
++    VkDevice device;
++    VkCuFunctionNVX function;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyCuFunctionNVX(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyCuFunctionNVX *op = (const void *)h;
++    rp_real.vkDestroyCuFunctionNVX(op->device, op->function, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyCuFunctionNVX(VkDevice device, VkCuFunctionNVX function, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyCuFunctionNVX *op;
++    struct rp_chunk *k;
++
++    if (!function || !(k = rp_defer_chunk(rp_replay_vkDestroyCuFunctionNVX, sizeof(*op))))
++    {
++        rp_real.vkDestroyCuFunctionNVX(device, function, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->function = function;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdCuLaunchKernelNVX(VkCommandBuffer commandBuffer, const VkCuLaunchInfoNVX* pLaunchInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 44);
++    rp_real.vkCmdCuLaunchKernelNVX(commandBuffer, pLaunchInfo);
++}
++
++struct rp_op_vkDestroyIndirectCommandsLayoutNV
++{
++    struct rp_op h;
++    VkDevice device;
++    VkIndirectCommandsLayoutNV indirectCommandsLayout;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyIndirectCommandsLayoutNV(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyIndirectCommandsLayoutNV *op = (const void *)h;
++    rp_real.vkDestroyIndirectCommandsLayoutNV(op->device, op->indirectCommandsLayout, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyIndirectCommandsLayoutNV(VkDevice device, VkIndirectCommandsLayoutNV indirectCommandsLayout, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyIndirectCommandsLayoutNV *op;
++    struct rp_chunk *k;
++
++    if (!indirectCommandsLayout || !(k = rp_defer_chunk(rp_replay_vkDestroyIndirectCommandsLayoutNV, sizeof(*op))))
++    {
++        rp_real.vkDestroyIndirectCommandsLayoutNV(device, indirectCommandsLayout, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->indirectCommandsLayout = indirectCommandsLayout;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++struct rp_op_vkDestroyIndirectCommandsLayoutEXT
++{
++    struct rp_op h;
++    VkDevice device;
++    VkIndirectCommandsLayoutEXT indirectCommandsLayout;
++    const VkAllocationCallbacks *pAllocator;
++};
++
++static void rp_replay_vkDestroyIndirectCommandsLayoutEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkDestroyIndirectCommandsLayoutEXT *op = (const void *)h;
++    rp_real.vkDestroyIndirectCommandsLayoutEXT(op->device, op->indirectCommandsLayout, op->pAllocator);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyIndirectCommandsLayoutEXT(VkDevice device, VkIndirectCommandsLayoutEXT indirectCommandsLayout, const VkAllocationCallbacks* pAllocator)
++{
++    struct rp_op_vkDestroyIndirectCommandsLayoutEXT *op;
++    struct rp_chunk *k;
++
++    if (!indirectCommandsLayout || !(k = rp_defer_chunk(rp_replay_vkDestroyIndirectCommandsLayoutEXT, sizeof(*op))))
++    {
++        rp_real.vkDestroyIndirectCommandsLayoutEXT(device, indirectCommandsLayout, pAllocator);
++        return;
++    }
++    op = (void *)k->data;
++    op->device = device;
++    op->indirectCommandsLayout = indirectCommandsLayout;
++    op->pAllocator = pAllocator;
++    rp_publish_chunk(k);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer, VkBool32 isPreprocessed, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 45);
++    rp_real.vkCmdExecuteGeneratedCommandsEXT(commandBuffer, isPreprocessed, pGeneratedCommandsInfo);
++}
++
++struct rp_op_vkCmdBindDescriptorBufferEmbeddedSamplersEXT
++{
++    struct rp_op h;
++    VkPipelineBindPoint pipelineBindPoint;
++    VkPipelineLayout layout;
++    uint32_t set;
++};
++
++static void rp_replay_vkCmdBindDescriptorBufferEmbeddedSamplersEXT(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdBindDescriptorBufferEmbeddedSamplersEXT *op = (const void *)h;
++    rp_real.vkCmdBindDescriptorBufferEmbeddedSamplersEXT(cb, op->pipelineBindPoint, op->layout, op->set);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindDescriptorBufferEmbeddedSamplersEXT(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout, uint32_t set)
++{
++    struct rp_op_vkCmdBindDescriptorBufferEmbeddedSamplersEXT *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdBindDescriptorBufferEmbeddedSamplersEXT(commandBuffer, pipelineBindPoint, layout, set);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdBindDescriptorBufferEmbeddedSamplersEXT, sizeof(*op));
++    op->pipelineBindPoint = pipelineBindPoint;
++    op->layout = layout;
++    op->set = set;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDecompressMemoryNV(VkCommandBuffer commandBuffer, uint32_t decompressRegionCount, const VkDecompressMemoryRegionNV* pDecompressMemoryRegions)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 46);
++    rp_real.vkCmdDecompressMemoryNV(commandBuffer, decompressRegionCount, pDecompressMemoryRegions);
++}
++
++struct rp_op_vkCmdDecompressMemoryIndirectCountNV
++{
++    struct rp_op h;
++    VkDeviceAddress indirectCommandsAddress;
++    VkDeviceAddress indirectCommandsCountAddress;
++    uint32_t stride;
++};
++
++static void rp_replay_vkCmdDecompressMemoryIndirectCountNV(VkCommandBuffer cb, const struct rp_op *h)
++{
++    const struct rp_op_vkCmdDecompressMemoryIndirectCountNV *op = (const void *)h;
++    rp_real.vkCmdDecompressMemoryIndirectCountNV(cb, op->indirectCommandsAddress, op->indirectCommandsCountAddress, op->stride);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDecompressMemoryIndirectCountNV(VkCommandBuffer commandBuffer, VkDeviceAddress indirectCommandsAddress, VkDeviceAddress indirectCommandsCountAddress, uint32_t stride)
++{
++    struct rp_op_vkCmdDecompressMemoryIndirectCountNV *op;
++
++    if (!RP_TAGGED(commandBuffer))
++    {
++        rp_real.vkCmdDecompressMemoryIndirectCountNV(commandBuffer, indirectCommandsAddress, indirectCommandsCountAddress, stride);
++        return;
++    }
++    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vkCmdDecompressMemoryIndirectCountNV, sizeof(*op));
++    op->indirectCommandsAddress = indirectCommandsAddress;
++    op->indirectCommandsCountAddress = indirectCommandsCountAddress;
++    op->stride = stride;
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindSamplerHeapEXT(VkCommandBuffer commandBuffer, const VkBindHeapInfoEXT* pBindInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 47);
++    rp_real.vkCmdBindSamplerHeapEXT(commandBuffer, pBindInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindResourceHeapEXT(VkCommandBuffer commandBuffer, const VkBindHeapInfoEXT* pBindInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 48);
++    rp_real.vkCmdBindResourceHeapEXT(commandBuffer, pBindInfo);
++}
++
++static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushDataEXT(VkCommandBuffer commandBuffer, const VkPushDataInfoEXT* pPushDataInfo)
++{
++    if (RP_TAGGED(commandBuffer))
++        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), 49);
++    rp_real.vkCmdPushDataEXT(commandBuffer, pPushDataInfo);
++}
++
++static const char *const rp_drain_names[] =
++{
++    "vkCmdBindVertexBuffers",
++    "vkCmdBlitImage2",
++    "vkCmdClearAttachments",
++    "vkCmdClearColorImage",
++    "vkCmdClearDepthStencilImage",
++    "vkCmdResolveImage2",
++    "vkCmdSetEvent2",
++    "vkCmdWaitEvents2",
++    "vkCmdBlitImage",
++    "vkCmdTraceRaysKHR",
++    "vkCmdTraceRaysIndirectKHR",
++    "vkCmdBuildAccelerationStructuresKHR",
++    "vkCmdWriteAccelerationStructuresPropertiesKHR",
++    "vkCmdCopyAccelerationStructureKHR",
++    "vkCmdSetFragmentShadingRateKHR",
++    "vkCmdBeginConditionalRendering2EXT",
++    "vkCmdBeginTransformFeedback2EXT",
++    "vkCmdBindIndexBuffer3KHR",
++    "vkCmdBindTransformFeedbackBuffers2EXT",
++    "vkCmdBindVertexBuffers3KHR",
++    "vkCmdCopyImageToMemoryKHR",
++    "vkCmdCopyMemoryKHR",
++    "vkCmdCopyMemoryToImageKHR",
++    "vkCmdCopyQueryPoolResultsToMemoryKHR",
++    "vkCmdDispatchIndirect2KHR",
++    "vkCmdDrawIndexedIndirect2KHR",
++    "vkCmdDrawIndexedIndirectCount2KHR",
++    "vkCmdDrawIndirect2KHR",
++    "vkCmdDrawIndirectByteCount2EXT",
++    "vkCmdDrawIndirectCount2KHR",
++    "vkCmdDrawMeshTasksIndirect2EXT",
++    "vkCmdDrawMeshTasksIndirectCount2EXT",
++    "vkCmdEndTransformFeedback2EXT",
++    "vkCmdFillMemoryKHR",
++    "vkCmdUpdateMemoryKHR",
++    "vkCmdWriteMarkerToMemoryAMD",
++    "vkCmdBeginConditionalRenderingEXT",
++    "vkCmdBeginDebugUtilsLabelEXT",
++    "vkCmdInsertDebugUtilsLabelEXT",
++    "vkCmdSetDepthBias2EXT",
++    "vkCmdBeginTransformFeedbackEXT",
++    "vkCmdBindTransformFeedbackBuffersEXT",
++    "vkCmdEndTransformFeedbackEXT",
++    "vkCmdSetCheckpointNV",
++    "vkCmdCuLaunchKernelNVX",
++    "vkCmdExecuteGeneratedCommandsEXT",
++    "vkCmdDecompressMemoryNV",
++    "vkCmdBindSamplerHeapEXT",
++    "vkCmdBindResourceHeapEXT",
++    "vkCmdPushDataEXT",
++};
++
++#define RP_DRAIN_COUNT 50
++
++#else
++
++static void rp_install_procs(struct vkd3d_vk_device_procs *vk)
++{
++    if (vk->vkAllocateCommandBuffers)
++        vk->vkAllocateCommandBuffers = rp_vkAllocateCommandBuffers;
++    if (vk->vkBeginCommandBuffer)
++        vk->vkBeginCommandBuffer = rp_vkBeginCommandBuffer;
++    if (vk->vkCmdBeginQuery)
++        vk->vkCmdBeginQuery = rp_vkCmdBeginQuery;
++    if (vk->vkCmdBeginRendering)
++        vk->vkCmdBeginRendering = rp_vkCmdBeginRendering;
++    if (vk->vkCmdBindDescriptorSets)
++        vk->vkCmdBindDescriptorSets = rp_vkCmdBindDescriptorSets;
++    if (vk->vkCmdBindIndexBuffer)
++        vk->vkCmdBindIndexBuffer = rp_vkCmdBindIndexBuffer;
++    if (vk->vkCmdBindPipeline)
++        vk->vkCmdBindPipeline = rp_vkCmdBindPipeline;
++    if (vk->vkCmdBindVertexBuffers)
++        vk->vkCmdBindVertexBuffers = rp_vkCmdBindVertexBuffers;
++    if (vk->vkCmdBindVertexBuffers2)
++        vk->vkCmdBindVertexBuffers2 = rp_vkCmdBindVertexBuffers2;
++    if (vk->vkCmdBlitImage2)
++        vk->vkCmdBlitImage2 = rp_vkCmdBlitImage2;
++    if (vk->vkCmdClearAttachments)
++        vk->vkCmdClearAttachments = rp_vkCmdClearAttachments;
++    if (vk->vkCmdClearColorImage)
++        vk->vkCmdClearColorImage = rp_vkCmdClearColorImage;
++    if (vk->vkCmdClearDepthStencilImage)
++        vk->vkCmdClearDepthStencilImage = rp_vkCmdClearDepthStencilImage;
++    if (vk->vkCmdCopyBuffer2)
++        vk->vkCmdCopyBuffer2 = rp_vkCmdCopyBuffer2;
++    if (vk->vkCmdCopyBufferToImage2)
++        vk->vkCmdCopyBufferToImage2 = rp_vkCmdCopyBufferToImage2;
++    if (vk->vkCmdCopyImage2)
++        vk->vkCmdCopyImage2 = rp_vkCmdCopyImage2;
++    if (vk->vkCmdCopyImageToBuffer2)
++        vk->vkCmdCopyImageToBuffer2 = rp_vkCmdCopyImageToBuffer2;
++    if (vk->vkCmdCopyQueryPoolResults)
++        vk->vkCmdCopyQueryPoolResults = rp_vkCmdCopyQueryPoolResults;
++    if (vk->vkCmdDispatch)
++        vk->vkCmdDispatch = rp_vkCmdDispatch;
++    if (vk->vkCmdDispatchIndirect)
++        vk->vkCmdDispatchIndirect = rp_vkCmdDispatchIndirect;
++    if (vk->vkCmdDraw)
++        vk->vkCmdDraw = rp_vkCmdDraw;
++    if (vk->vkCmdDrawIndexed)
++        vk->vkCmdDrawIndexed = rp_vkCmdDrawIndexed;
++    if (vk->vkCmdDrawIndexedIndirect)
++        vk->vkCmdDrawIndexedIndirect = rp_vkCmdDrawIndexedIndirect;
++    if (vk->vkCmdDrawIndexedIndirectCount)
++        vk->vkCmdDrawIndexedIndirectCount = rp_vkCmdDrawIndexedIndirectCount;
++    if (vk->vkCmdDrawIndirect)
++        vk->vkCmdDrawIndirect = rp_vkCmdDrawIndirect;
++    if (vk->vkCmdDrawIndirectCount)
++        vk->vkCmdDrawIndirectCount = rp_vkCmdDrawIndirectCount;
++    if (vk->vkCmdEndQuery)
++        vk->vkCmdEndQuery = rp_vkCmdEndQuery;
++    if (vk->vkCmdEndRendering)
++        vk->vkCmdEndRendering = rp_vkCmdEndRendering;
++    if (vk->vkCmdExecuteCommands)
++        vk->vkCmdExecuteCommands = rp_vkCmdExecuteCommands;
++    if (vk->vkCmdFillBuffer)
++        vk->vkCmdFillBuffer = rp_vkCmdFillBuffer;
++    if (vk->vkCmdNextSubpass)
++        vk->vkCmdNextSubpass = rp_vkCmdNextSubpass;
++    if (vk->vkCmdPipelineBarrier2)
++        vk->vkCmdPipelineBarrier2 = rp_vkCmdPipelineBarrier2;
++    if (vk->vkCmdPushConstants)
++        vk->vkCmdPushConstants = rp_vkCmdPushConstants;
++    if (vk->vkCmdResetEvent2)
++        vk->vkCmdResetEvent2 = rp_vkCmdResetEvent2;
++    if (vk->vkCmdResetQueryPool)
++        vk->vkCmdResetQueryPool = rp_vkCmdResetQueryPool;
++    if (vk->vkCmdResolveImage2)
++        vk->vkCmdResolveImage2 = rp_vkCmdResolveImage2;
++    if (vk->vkCmdSetBlendConstants)
++        vk->vkCmdSetBlendConstants = rp_vkCmdSetBlendConstants;
++    if (vk->vkCmdSetDepthBias)
++        vk->vkCmdSetDepthBias = rp_vkCmdSetDepthBias;
++    if (vk->vkCmdSetDepthBiasEnable)
++        vk->vkCmdSetDepthBiasEnable = rp_vkCmdSetDepthBiasEnable;
++    if (vk->vkCmdSetDepthBounds)
++        vk->vkCmdSetDepthBounds = rp_vkCmdSetDepthBounds;
++    if (vk->vkCmdSetEvent2)
++        vk->vkCmdSetEvent2 = rp_vkCmdSetEvent2;
++    if (vk->vkCmdSetLineWidth)
++        vk->vkCmdSetLineWidth = rp_vkCmdSetLineWidth;
++    if (vk->vkCmdSetPrimitiveRestartEnable)
++        vk->vkCmdSetPrimitiveRestartEnable = rp_vkCmdSetPrimitiveRestartEnable;
++    if (vk->vkCmdSetPrimitiveTopology)
++        vk->vkCmdSetPrimitiveTopology = rp_vkCmdSetPrimitiveTopology;
++    if (vk->vkCmdSetScissor)
++        vk->vkCmdSetScissor = rp_vkCmdSetScissor;
++    if (vk->vkCmdSetScissorWithCount)
++        vk->vkCmdSetScissorWithCount = rp_vkCmdSetScissorWithCount;
++    if (vk->vkCmdSetStencilCompareMask)
++        vk->vkCmdSetStencilCompareMask = rp_vkCmdSetStencilCompareMask;
++    if (vk->vkCmdSetStencilReference)
++        vk->vkCmdSetStencilReference = rp_vkCmdSetStencilReference;
++    if (vk->vkCmdSetStencilWriteMask)
++        vk->vkCmdSetStencilWriteMask = rp_vkCmdSetStencilWriteMask;
++    if (vk->vkCmdSetViewport)
++        vk->vkCmdSetViewport = rp_vkCmdSetViewport;
++    if (vk->vkCmdSetViewportWithCount)
++        vk->vkCmdSetViewportWithCount = rp_vkCmdSetViewportWithCount;
++    if (vk->vkCmdUpdateBuffer)
++        vk->vkCmdUpdateBuffer = rp_vkCmdUpdateBuffer;
++    if (vk->vkCmdWaitEvents2)
++        vk->vkCmdWaitEvents2 = rp_vkCmdWaitEvents2;
++    if (vk->vkCmdWriteTimestamp2)
++        vk->vkCmdWriteTimestamp2 = rp_vkCmdWriteTimestamp2;
++    if (vk->vkDestroyBuffer)
++        vk->vkDestroyBuffer = rp_vkDestroyBuffer;
++    if (vk->vkDestroyBufferView)
++        vk->vkDestroyBufferView = rp_vkDestroyBufferView;
++    if (vk->vkDestroyCommandPool)
++        vk->vkDestroyCommandPool = rp_vkDestroyCommandPool;
++    if (vk->vkDestroyDescriptorPool)
++        vk->vkDestroyDescriptorPool = rp_vkDestroyDescriptorPool;
++    if (vk->vkDestroyDescriptorSetLayout)
++        vk->vkDestroyDescriptorSetLayout = rp_vkDestroyDescriptorSetLayout;
++    if (vk->vkDestroyEvent)
++        vk->vkDestroyEvent = rp_vkDestroyEvent;
++    if (vk->vkDestroyFence)
++        vk->vkDestroyFence = rp_vkDestroyFence;
++    if (vk->vkDestroyFramebuffer)
++        vk->vkDestroyFramebuffer = rp_vkDestroyFramebuffer;
++    if (vk->vkDestroyImage)
++        vk->vkDestroyImage = rp_vkDestroyImage;
++    if (vk->vkDestroyImageView)
++        vk->vkDestroyImageView = rp_vkDestroyImageView;
++    if (vk->vkDestroyPipeline)
++        vk->vkDestroyPipeline = rp_vkDestroyPipeline;
++    if (vk->vkDestroyPipelineCache)
++        vk->vkDestroyPipelineCache = rp_vkDestroyPipelineCache;
++    if (vk->vkDestroyPipelineLayout)
++        vk->vkDestroyPipelineLayout = rp_vkDestroyPipelineLayout;
++    if (vk->vkDestroyQueryPool)
++        vk->vkDestroyQueryPool = rp_vkDestroyQueryPool;
++    if (vk->vkDestroySampler)
++        vk->vkDestroySampler = rp_vkDestroySampler;
++    if (vk->vkDestroySemaphore)
++        vk->vkDestroySemaphore = rp_vkDestroySemaphore;
++    if (vk->vkDestroyShaderModule)
++        vk->vkDestroyShaderModule = rp_vkDestroyShaderModule;
++    if (vk->vkEndCommandBuffer)
++        vk->vkEndCommandBuffer = rp_vkEndCommandBuffer;
++    if (vk->vkFreeCommandBuffers)
++        vk->vkFreeCommandBuffers = rp_vkFreeCommandBuffers;
++    if (vk->vkFreeDescriptorSets)
++        vk->vkFreeDescriptorSets = rp_vkFreeDescriptorSets;
++    if (vk->vkFreeMemory)
++        vk->vkFreeMemory = rp_vkFreeMemory;
++    if (vk->vkQueueSubmit2)
++        vk->vkQueueSubmit2 = rp_vkQueueSubmit2;
++    if (vk->vkResetCommandBuffer)
++        vk->vkResetCommandBuffer = rp_vkResetCommandBuffer;
++    if (vk->vkResetCommandPool)
++        vk->vkResetCommandPool = rp_vkResetCommandPool;
++    if (vk->vkResetDescriptorPool)
++        vk->vkResetDescriptorPool = rp_vkResetDescriptorPool;
++    if (vk->vkCmdSetDepthWriteEnable)
++        vk->vkCmdSetDepthWriteEnable = rp_vkCmdSetDepthWriteEnable;
++    if (vk->vkCmdBlitImage)
++        vk->vkCmdBlitImage = rp_vkCmdBlitImage;
++    if (vk->vkCmdPushDescriptorSetKHR)
++        vk->vkCmdPushDescriptorSetKHR = rp_vkCmdPushDescriptorSetKHR;
++    if (vk->vkCmdSetRayTracingPipelineStackSizeKHR)
++        vk->vkCmdSetRayTracingPipelineStackSizeKHR = rp_vkCmdSetRayTracingPipelineStackSizeKHR;
++    if (vk->vkCmdTraceRaysKHR)
++        vk->vkCmdTraceRaysKHR = rp_vkCmdTraceRaysKHR;
++    if (vk->vkCmdTraceRaysIndirectKHR)
++        vk->vkCmdTraceRaysIndirectKHR = rp_vkCmdTraceRaysIndirectKHR;
++    if (vk->vkDestroyAccelerationStructureKHR)
++        vk->vkDestroyAccelerationStructureKHR = rp_vkDestroyAccelerationStructureKHR;
++    if (vk->vkCmdBuildAccelerationStructuresKHR)
++        vk->vkCmdBuildAccelerationStructuresKHR = rp_vkCmdBuildAccelerationStructuresKHR;
++    if (vk->vkCmdWriteAccelerationStructuresPropertiesKHR)
++        vk->vkCmdWriteAccelerationStructuresPropertiesKHR = rp_vkCmdWriteAccelerationStructuresPropertiesKHR;
++    if (vk->vkCmdCopyAccelerationStructureKHR)
++        vk->vkCmdCopyAccelerationStructureKHR = rp_vkCmdCopyAccelerationStructureKHR;
++    if (vk->vkCmdSetFragmentShadingRateKHR)
++        vk->vkCmdSetFragmentShadingRateKHR = rp_vkCmdSetFragmentShadingRateKHR;
++    if (vk->vkCmdBeginConditionalRendering2EXT)
++        vk->vkCmdBeginConditionalRendering2EXT = rp_vkCmdBeginConditionalRendering2EXT;
++    if (vk->vkCmdBeginTransformFeedback2EXT)
++        vk->vkCmdBeginTransformFeedback2EXT = rp_vkCmdBeginTransformFeedback2EXT;
++    if (vk->vkCmdBindIndexBuffer3KHR)
++        vk->vkCmdBindIndexBuffer3KHR = rp_vkCmdBindIndexBuffer3KHR;
++    if (vk->vkCmdBindTransformFeedbackBuffers2EXT)
++        vk->vkCmdBindTransformFeedbackBuffers2EXT = rp_vkCmdBindTransformFeedbackBuffers2EXT;
++    if (vk->vkCmdBindVertexBuffers3KHR)
++        vk->vkCmdBindVertexBuffers3KHR = rp_vkCmdBindVertexBuffers3KHR;
++    if (vk->vkCmdCopyImageToMemoryKHR)
++        vk->vkCmdCopyImageToMemoryKHR = rp_vkCmdCopyImageToMemoryKHR;
++    if (vk->vkCmdCopyMemoryKHR)
++        vk->vkCmdCopyMemoryKHR = rp_vkCmdCopyMemoryKHR;
++    if (vk->vkCmdCopyMemoryToImageKHR)
++        vk->vkCmdCopyMemoryToImageKHR = rp_vkCmdCopyMemoryToImageKHR;
++    if (vk->vkCmdCopyQueryPoolResultsToMemoryKHR)
++        vk->vkCmdCopyQueryPoolResultsToMemoryKHR = rp_vkCmdCopyQueryPoolResultsToMemoryKHR;
++    if (vk->vkCmdDispatchIndirect2KHR)
++        vk->vkCmdDispatchIndirect2KHR = rp_vkCmdDispatchIndirect2KHR;
++    if (vk->vkCmdDrawIndexedIndirect2KHR)
++        vk->vkCmdDrawIndexedIndirect2KHR = rp_vkCmdDrawIndexedIndirect2KHR;
++    if (vk->vkCmdDrawIndexedIndirectCount2KHR)
++        vk->vkCmdDrawIndexedIndirectCount2KHR = rp_vkCmdDrawIndexedIndirectCount2KHR;
++    if (vk->vkCmdDrawIndirect2KHR)
++        vk->vkCmdDrawIndirect2KHR = rp_vkCmdDrawIndirect2KHR;
++    if (vk->vkCmdDrawIndirectByteCount2EXT)
++        vk->vkCmdDrawIndirectByteCount2EXT = rp_vkCmdDrawIndirectByteCount2EXT;
++    if (vk->vkCmdDrawIndirectCount2KHR)
++        vk->vkCmdDrawIndirectCount2KHR = rp_vkCmdDrawIndirectCount2KHR;
++    if (vk->vkCmdDrawMeshTasksIndirect2EXT)
++        vk->vkCmdDrawMeshTasksIndirect2EXT = rp_vkCmdDrawMeshTasksIndirect2EXT;
++    if (vk->vkCmdDrawMeshTasksIndirectCount2EXT)
++        vk->vkCmdDrawMeshTasksIndirectCount2EXT = rp_vkCmdDrawMeshTasksIndirectCount2EXT;
++    if (vk->vkCmdEndTransformFeedback2EXT)
++        vk->vkCmdEndTransformFeedback2EXT = rp_vkCmdEndTransformFeedback2EXT;
++    if (vk->vkCmdFillMemoryKHR)
++        vk->vkCmdFillMemoryKHR = rp_vkCmdFillMemoryKHR;
++    if (vk->vkCmdUpdateMemoryKHR)
++        vk->vkCmdUpdateMemoryKHR = rp_vkCmdUpdateMemoryKHR;
++    if (vk->vkCmdWriteMarkerToMemoryAMD)
++        vk->vkCmdWriteMarkerToMemoryAMD = rp_vkCmdWriteMarkerToMemoryAMD;
++    if (vk->vkCmdBeginConditionalRenderingEXT)
++        vk->vkCmdBeginConditionalRenderingEXT = rp_vkCmdBeginConditionalRenderingEXT;
++    if (vk->vkCmdEndConditionalRenderingEXT)
++        vk->vkCmdEndConditionalRenderingEXT = rp_vkCmdEndConditionalRenderingEXT;
++    if (vk->vkSetDebugUtilsObjectNameEXT)
++        vk->vkSetDebugUtilsObjectNameEXT = rp_vkSetDebugUtilsObjectNameEXT;
++    if (vk->vkCmdBeginDebugUtilsLabelEXT)
++        vk->vkCmdBeginDebugUtilsLabelEXT = rp_vkCmdBeginDebugUtilsLabelEXT;
++    if (vk->vkCmdEndDebugUtilsLabelEXT)
++        vk->vkCmdEndDebugUtilsLabelEXT = rp_vkCmdEndDebugUtilsLabelEXT;
++    if (vk->vkCmdInsertDebugUtilsLabelEXT)
++        vk->vkCmdInsertDebugUtilsLabelEXT = rp_vkCmdInsertDebugUtilsLabelEXT;
++    if (vk->vkCmdSetDepthBias2EXT)
++        vk->vkCmdSetDepthBias2EXT = rp_vkCmdSetDepthBias2EXT;
++    if (vk->vkCmdBeginQueryIndexedEXT)
++        vk->vkCmdBeginQueryIndexedEXT = rp_vkCmdBeginQueryIndexedEXT;
++    if (vk->vkCmdBeginTransformFeedbackEXT)
++        vk->vkCmdBeginTransformFeedbackEXT = rp_vkCmdBeginTransformFeedbackEXT;
++    if (vk->vkCmdBindTransformFeedbackBuffersEXT)
++        vk->vkCmdBindTransformFeedbackBuffersEXT = rp_vkCmdBindTransformFeedbackBuffersEXT;
++    if (vk->vkCmdEndQueryIndexedEXT)
++        vk->vkCmdEndQueryIndexedEXT = rp_vkCmdEndQueryIndexedEXT;
++    if (vk->vkCmdEndTransformFeedbackEXT)
++        vk->vkCmdEndTransformFeedbackEXT = rp_vkCmdEndTransformFeedbackEXT;
++    if (vk->vkCmdSetPatchControlPointsEXT)
++        vk->vkCmdSetPatchControlPointsEXT = rp_vkCmdSetPatchControlPointsEXT;
++    if (vk->vkCmdSetRasterizationSamplesEXT)
++        vk->vkCmdSetRasterizationSamplesEXT = rp_vkCmdSetRasterizationSamplesEXT;
++    if (vk->vkCmdDrawMeshTasksEXT)
++        vk->vkCmdDrawMeshTasksEXT = rp_vkCmdDrawMeshTasksEXT;
++    if (vk->vkCmdDrawMeshTasksIndirectEXT)
++        vk->vkCmdDrawMeshTasksIndirectEXT = rp_vkCmdDrawMeshTasksIndirectEXT;
++    if (vk->vkCmdDrawMeshTasksIndirectCountEXT)
++        vk->vkCmdDrawMeshTasksIndirectCountEXT = rp_vkCmdDrawMeshTasksIndirectCountEXT;
++    if (vk->vkDestroySwapchainKHR)
++        vk->vkDestroySwapchainKHR = rp_vkDestroySwapchainKHR;
++    if (vk->vkCmdTraceRaysIndirect2KHR)
++        vk->vkCmdTraceRaysIndirect2KHR = rp_vkCmdTraceRaysIndirect2KHR;
++    if (vk->vkCmdBindIndexBuffer2KHR)
++        vk->vkCmdBindIndexBuffer2KHR = rp_vkCmdBindIndexBuffer2KHR;
++    if (vk->vkCmdWriteBufferMarkerAMD)
++        vk->vkCmdWriteBufferMarkerAMD = rp_vkCmdWriteBufferMarkerAMD;
++    if (vk->vkCmdWriteBufferMarker2AMD)
++        vk->vkCmdWriteBufferMarker2AMD = rp_vkCmdWriteBufferMarker2AMD;
++    if (vk->vkCmdSetCheckpointNV)
++        vk->vkCmdSetCheckpointNV = rp_vkCmdSetCheckpointNV;
++    if (vk->vkDestroyCuModuleNVX)
++        vk->vkDestroyCuModuleNVX = rp_vkDestroyCuModuleNVX;
++    if (vk->vkDestroyCuFunctionNVX)
++        vk->vkDestroyCuFunctionNVX = rp_vkDestroyCuFunctionNVX;
++    if (vk->vkCmdCuLaunchKernelNVX)
++        vk->vkCmdCuLaunchKernelNVX = rp_vkCmdCuLaunchKernelNVX;
++    if (vk->vkDestroyIndirectCommandsLayoutNV)
++        vk->vkDestroyIndirectCommandsLayoutNV = rp_vkDestroyIndirectCommandsLayoutNV;
++    if (vk->vkCmdExecuteGeneratedCommandsNV)
++        vk->vkCmdExecuteGeneratedCommandsNV = rp_vkCmdExecuteGeneratedCommandsNV;
++    if (vk->vkCmdPreprocessGeneratedCommandsNV)
++        vk->vkCmdPreprocessGeneratedCommandsNV = rp_vkCmdPreprocessGeneratedCommandsNV;
++    if (vk->vkDestroyIndirectCommandsLayoutEXT)
++        vk->vkDestroyIndirectCommandsLayoutEXT = rp_vkDestroyIndirectCommandsLayoutEXT;
++    if (vk->vkCmdExecuteGeneratedCommandsEXT)
++        vk->vkCmdExecuteGeneratedCommandsEXT = rp_vkCmdExecuteGeneratedCommandsEXT;
++    if (vk->vkCmdPreprocessGeneratedCommandsEXT)
++        vk->vkCmdPreprocessGeneratedCommandsEXT = rp_vkCmdPreprocessGeneratedCommandsEXT;
++    if (vk->vkCmdBindDescriptorBuffersEXT)
++        vk->vkCmdBindDescriptorBuffersEXT = rp_vkCmdBindDescriptorBuffersEXT;
++    if (vk->vkCmdBindDescriptorBufferEmbeddedSamplersEXT)
++        vk->vkCmdBindDescriptorBufferEmbeddedSamplersEXT = rp_vkCmdBindDescriptorBufferEmbeddedSamplersEXT;
++    if (vk->vkCmdSetDescriptorBufferOffsetsEXT)
++        vk->vkCmdSetDescriptorBufferOffsetsEXT = rp_vkCmdSetDescriptorBufferOffsetsEXT;
++    if (vk->vkCmdDecompressMemoryNV)
++        vk->vkCmdDecompressMemoryNV = rp_vkCmdDecompressMemoryNV;
++    if (vk->vkCmdDecompressMemoryIndirectCountNV)
++        vk->vkCmdDecompressMemoryIndirectCountNV = rp_vkCmdDecompressMemoryIndirectCountNV;
++    if (vk->vkCmdBindSamplerHeapEXT)
++        vk->vkCmdBindSamplerHeapEXT = rp_vkCmdBindSamplerHeapEXT;
++    if (vk->vkCmdBindResourceHeapEXT)
++        vk->vkCmdBindResourceHeapEXT = rp_vkCmdBindResourceHeapEXT;
++    if (vk->vkCmdPushDataEXT)
++        vk->vkCmdPushDataEXT = rp_vkCmdPushDataEXT;
++}
++
++#endif
+diff --git a/libs/vkd3d/cmdreplay_gen.py b/libs/vkd3d/cmdreplay_gen.py
+new file mode 100644
+index 00000000..b843a0d9
+--- /dev/null
++++ b/libs/vkd3d/cmdreplay_gen.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++"""Generates cmdreplay_gen.h for cmdreplay.c (miles-bench deferred command recording).
++
++    python3 libs/vkd3d/cmdreplay_gen.py
++
++For every device function vkd3d loads (vulkan_procs.h):
++  - vkCmd* whose arguments after the command buffer are all plain values: an op struct, a recorder
++    (rp_vkCmdX) that appends the op to the command buffer's stream, and its replay;
++  - every other vkCmd* without a hand-written rp_vkCmdX in cmdreplay.c: a drain wrapper (the worker
++    finishes everything published, then the call goes straight to the driver on this thread);
++  - vkDestroy* / vkFree* / vkResetDescriptorPool: a guard that waits for the worker to finish
++    every published op first (a replayed op may still name the object).
++Any other function that can see a command buffer must be hand-written in cmdreplay.c, or this
++script fails: a tagged handle must never reach the driver.
++"""
++import os
++import re
++import sys
++
++here = os.path.dirname(os.path.abspath(__file__))
++root = os.path.normpath(os.path.join(here, "..", ".."))
++header = open(os.path.join(root, "khronos/Vulkan-Headers/include/vulkan/vulkan_core.h")).read()
++procs = open(os.path.join(here, "vulkan_procs.h")).read()
++impl = open(os.path.join(here, "cmdreplay.c")).read()
++
++device_fns = re.findall(r"^VK_DEVICE(?:_EXT)?_PFN\((vk\w+)\)", procs, re.M)
++hand = set(re.findall(r"^static VKAPI_ATTR \w+ VKAPI_CALL rp_(vk\w+)\(", impl, re.M))
++hand |= set(re.findall(r"^RP_COPY_RECORDER\((vk\w+),", impl, re.M))
++
++protos = {}
++for ret, name, params in re.findall(r"VKAPI_ATTR (\w+) VKAPI_CALL (vk\w+)\(\s*(.*?)\);", header, re.S):
++    plist = []
++    for p in params.split(","):
++        p = " ".join(p.split())
++        m = re.match(r"(.*?)\s*(\w+)(\[\d+\])?$", p)
++        ptype, pname, arr = m.group(1), m.group(2), m.group(3) or ""
++        plist.append((ptype, pname, arr))
++    protos[name] = (ret, plist)
++
++# Types through which a command buffer handle can reach a function.
++CB_TYPES = ("VkCommandBuffer", "VkSubmitInfo", "VkSubmitInfo2", "VkCommandBufferSubmitInfo",
++            "VkDebugUtilsObjectNameInfoEXT", "VkDebugUtilsObjectTagInfoEXT")
++GUARDED = lambda n: (n.startswith(("vkDestroy", "vkFree")) or n == "vkResetDescriptorPool") and n not in (
++    "vkDestroyDevice", "vkDestroyCommandPool", "vkFreeCommandBuffers")
++
++
++# Destroys of the form (device, handle, pAllocator) are queued behind the published ops instead of
++# waiting for them; fences, semaphores, swapchains and caches stay synchronous (a caller may rely on
++# them being gone, e.g. a swapchain's surface being free again).
++DEFERRED = lambda n, ret, pl: (ret == "void" and len(pl) == 3 and pl[0][0] == "VkDevice"
++        and pl[2][0] == "const VkAllocationCallbacks*" and n not in (
++        "vkDestroyFence", "vkDestroySemaphore", "vkDestroySwapchainKHR", "vkDestroyPipelineCache"))
++
++
++def by_value(ptype, arr):
++    return "*" not in ptype and not arr
++
++
++def decl(plist):
++    return ", ".join(f"{t} {n}{a}" for t, n, a in plist)
++
++
++out = ["/* Generated by cmdreplay_gen.py from vulkan_core.h and vulkan_procs.h; do not edit. */", "",
++       "#ifndef RP_GEN_INSTALL", ""]
++installs, drains, missing = [], [], []
++for name in device_fns:
++    if name not in protos:
++        continue
++    ret, plist = protos[name]
++    sees_cb = any(any(re.search(rf"\b{t}\b", p[0]) for t in CB_TYPES) for p in plist)
++    if name.startswith("vkCmd") and plist[0][0] == "VkCommandBuffer":
++        if name in hand:
++            installs.append(name)
++            continue
++        if any(re.search(rf"\b{t}\b", p[0]) for t in CB_TYPES for p in plist[1:]):
++            missing.append(name)
++            continue
++        args = ", ".join(n for _, n, _ in plist[1:])
++        if all(by_value(t, a) for t, _, a in plist[1:]) and not any(re.search(rf"\b{t}\b", p[0]) for t in CB_TYPES for p in plist[1:]):
++            fields = "".join(f"    {t} {n};\n" for t, n, _ in plist[1:])
++            sets = "".join(f"    op->{n} = {n};\n" for _, n, _ in plist[1:])
++            oargs = ", ".join(f"op->{n}" for _, n, _ in plist[1:])
++            out.append(f"struct rp_op_{name}\n{{\n    struct rp_op h;\n{fields}}};\n")
++            out.append(f"static void rp_replay_{name}(VkCommandBuffer cb, const struct rp_op *h)\n{{\n"
++                       + (f"    const struct rp_op_{name} *op = (const void *)h;\n" if plist[1:] else "    (void)h;\n")
++                       + f"    rp_real.{name}(cb{', ' if oargs else ''}{oargs});\n}}\n")
++            out.append(f"static VKAPI_ATTR void VKAPI_CALL rp_{name}({decl(plist)})\n{{\n"
++                       + (f"    struct rp_op_{name} *op;\n\n" if plist[1:] else "")
++                       + f"    if (!RP_TAGGED(commandBuffer))\n"
++                       f"    {{\n        rp_real.{name}(commandBuffer{', ' if args else ''}{args});\n        return;\n    }}\n"
++                       + (f"    op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_{name}, sizeof(*op));\n{sets}}}\n" if plist[1:] else
++                          f"    rp_op_alloc(RP_CB(commandBuffer), rp_replay_{name}, sizeof(struct rp_op_{name}));\n}}\n"))
++        else:
++            idx = len(drains)
++            drains.append(name)
++            out.append(f"static VKAPI_ATTR {ret} VKAPI_CALL rp_{name}({decl(plist)})\n{{\n"
++                       f"    if (RP_TAGGED(commandBuffer))\n"
++                       f"        commandBuffer = rp_drain_for_direct(RP_CB(commandBuffer), {idx});\n"
++                       f"    {'return ' if ret != 'void' else ''}rp_real.{name}(commandBuffer{', ' if args else ''}{args});\n}}\n")
++        installs.append(name)
++    elif name in hand:
++        installs.append(name)
++    elif sees_cb:
++        missing.append(name)
++    elif GUARDED(name) and DEFERRED(name, ret, plist):
++        h = plist[1][1]
++        out.append(f"struct rp_op_{name}\n{{\n    struct rp_op h;\n    VkDevice device;\n    {plist[1][0]} {h};\n"
++                   f"    const VkAllocationCallbacks *pAllocator;\n}};\n")
++        out.append(f"static void rp_replay_{name}(VkCommandBuffer cb, const struct rp_op *h)\n{{\n"
++                   f"    const struct rp_op_{name} *op = (const void *)h;\n"
++                   f"    rp_real.{name}(op->device, op->{h}, op->pAllocator);\n}}\n")
++        out.append(f"static VKAPI_ATTR void VKAPI_CALL rp_{name}({decl(plist)})\n{{\n"
++                   f"    struct rp_op_{name} *op;\n    struct rp_chunk *k;\n\n"
++                   f"    if (!{h} || !(k = rp_defer_chunk(rp_replay_{name}, sizeof(*op))))\n"
++                   f"    {{\n        rp_real.{name}(device, {h}, pAllocator);\n        return;\n    }}\n"
++                   f"    op = (void *)k->data;\n    op->device = device;\n    op->{h} = {h};\n    op->pAllocator = pAllocator;\n"
++                   f"    rp_publish_chunk(k);\n}}\n")
++        installs.append(name)
++    elif GUARDED(name):
++        args = ", ".join(n for _, n, _ in plist)
++        out.append(f"static VKAPI_ATTR {ret} VKAPI_CALL rp_{name}({decl(plist)})\n{{\n"
++                   f"    rp_guard();\n"
++                   f"    {'return ' if ret != 'void' else ''}rp_real.{name}({args});\n}}\n")
++        installs.append(name)
++
++if missing:
++    sys.exit("cmdreplay_gen.py: these functions can see a command buffer but have no hand-written "
++             "wrapper in cmdreplay.c: " + ", ".join(missing))
++
++out.append("static const char *const rp_drain_names[] =\n{")
++out += [f'    "{n}",' for n in drains] or ['    "",']
++out.append("};\n")
++out.append(f"#define RP_DRAIN_COUNT {max(len(drains), 1)}\n")
++out.append("#else\n")
++out.append("static void rp_install_procs(struct vkd3d_vk_device_procs *vk)\n{")
++for n in installs:
++    out.append(f"    if (vk->{n})\n        vk->{n} = rp_{n};")
++out.append("}\n")
++out.append("#endif")
++open(os.path.join(here, "cmdreplay_gen.h"), "w").write("\n".join(out) + "\n")
++print(f"cmdreplay_gen.h: {len(installs)} wrappers, {len(drains)} drain fallbacks, "
++      f"{len(hand)} hand-written")
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 60fe9cf7..495e518b 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -3386,6 +3386,11 @@ static HRESULT d3d12_command_allocator_init(struct d3d12_command_allocator *allo
+ 
+     /* GRAPHICS/COMPUTE queue must support (1, 1, 1) granularity. */
+ 
++    /* miles-bench: this allocator's command buffers record through the replay worker (cmdreplay.c). Pools
++     * recycled through the device's cache were registered when created; registering is idempotent. */
++    vkd3d_cmd_replay_register_pool(allocator->primary_pool.vk_command_pool);
++    vkd3d_cmd_replay_register_pool(allocator->fallback_pool.vk_command_pool);
++
+     d3d_destruction_notifier_init(&allocator->destruction_notifier,
+             (IUnknown*)&allocator->ID3D12CommandAllocator_iface);
+     d3d12_device_add_ref(allocator->device = device);
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 72afda04..a2df2a6e 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4221,6 +4221,7 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
+ 
+     device->vk_device = vk_device;
+     vkd3d_gputime_install(device);
++    vkd3d_cmd_replay_install(device);
+ 
+     if (FAILED(hr = d3d12_device_create_vkd3d_queues(device, &device_queue_info)))
+     {
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index eeb50ccc..b90c0df0 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -77,6 +77,7 @@ vkd3d_src = [
+   'memtrace.c',
+   'enginepatch.c',
+   'gputime.c',
++  'cmdreplay.c',
+   'geomirror.c',
+   'benchinput.c',
+   'idxcache.c',
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index ad3b670b..6c043cbf 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1138,6 +1138,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     vkd3d_frametrace_present();
+     vkd3d_index_cache_present();
+     vkd3d_gputime_present();
++    vkd3d_cmd_replay_report();
+ 
+     assert(chain->user.index < chain->desc.BufferCount);
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 59fd4e82..97876ed7 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -7473,6 +7473,11 @@ void vkd3d_frametrace_event(const char *fmt, ...) VKD3D_PRINTF_FUNC(1, 2);
+ void vkd3d_frametrace_bind_heap(struct d3d12_descriptor_heap *heap);
+ void vkd3d_frametrace_viewport(float width, float height);
+ void vkd3d_gputime_install(struct d3d12_device *device);
++/* cmdreplay.c: command lists record through a replay worker (VKD3D_BENCH_CMD_REPLAY=1). */
++void vkd3d_cmd_replay_install(struct d3d12_device *device);
++void vkd3d_cmd_replay_register_pool(VkCommandPool vk_pool);
++void vkd3d_cmd_replay_report(void);
++bool vkd3d_cmd_replay_enabled(void);
+ void vkd3d_gputime_present(void);
+ void vkd3d_gputime_note(VkCommandBuffer cmd, const char *fmt, ...);
+ void vkd3d_gputime_ecl(VkCommandBuffer cmd);

@@ -1,0 +1,432 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zaid <nottzaid@tutamail.com>
+Date: Wed, 21 Oct 2026 01:34:50 +0300
+Subject: [PATCH 11/12] miles-bench cmdreplay: review fixes
+
+Interop (GetVulkanHandle, BeginVkCommandBufferInterop) gets the real handle after a drain; later
+devices fill entry points the first device lacked; vkDestroyDevice waits for queued destroys;
+queued destroys use exact-size chunks and the chunk free list is capped; guards skip NULL handles
+(vkDestroyPipelineCache(NULL) on every PSO release waited for the worker); vkFreeMemory is no
+longer held back (VRAM goes back at once; frees follow GPU completion, so their ops were replayed);
+push descriptor copies follow descriptorType; OOM unlink fix; the generator fails on procs without
+a prototype.
+---
+ libs/vkd3d/cmdreplay.c              | 113 ++++++++++++++++++++++++----
+ libs/vkd3d/cmdreplay_gen.h          |  53 ++++---------
+ libs/vkd3d/cmdreplay_gen.py         |  10 ++-
+ libs/vkd3d/command_list_vkd3d_ext.c |   3 +-
+ libs/vkd3d/device_vkd3d_ext.c       |   3 +-
+ libs/vkd3d/vkd3d_private.h          |   1 +
+ 6 files changed, 125 insertions(+), 58 deletions(-)
+
+diff --git a/libs/vkd3d/cmdreplay.c b/libs/vkd3d/cmdreplay.c
+index 3d1f7178..79eb829f 100644
+--- a/libs/vkd3d/cmdreplay.c
++++ b/libs/vkd3d/cmdreplay.c
+@@ -69,11 +69,12 @@ struct rp_cb
+ #define RP_HANDLE(c) ((VkCommandBuffer)((uintptr_t)(c) | 1))
+ 
+ #define RP_CHUNK_SIZE (64u << 10)
++#define RP_FREE_MAX 64 /* chunks kept for reuse */
+ /* A chunk is published once it holds this many ops (at the next op): the worker replays a long
+  * command buffer while it is still being recorded. */
+ #define RP_PUBLISH_OPS 96
+ /* Pause loops before sleeping: the worker between chunks, waiters for the worker. */
+-#define RP_WORKER_SPIN 20000
++#define RP_WORKER_SPIN 8000
+ #define RP_WAIT_SPIN 4000
+ 
+ static struct vkd3d_vk_device_procs rp_real;
+@@ -84,6 +85,7 @@ static struct
+     pthread_mutex_t lock;
+     pthread_cond_t work_cond, done_cond;
+     struct rp_chunk *head, *tail, *free;
++    unsigned int free_count;
+     uint64_t published; /* written under lock */
+     uint64_t done;      /* last chunk replayed */
+     LONG waiters;
+@@ -116,16 +118,19 @@ static uint64_t rp_now_us(void)
+     return (uint64_t)(t.QuadPart * 1000000.0 / f.QuadPart);
+ }
+ 
+-static struct rp_chunk *rp_chunk_get(VkCommandBuffer vk_cb, uint32_t min_size)
++static struct rp_chunk *rp_chunk_get(VkCommandBuffer vk_cb, uint32_t min_size, bool exact)
+ {
+     struct rp_chunk *k = NULL;
+-    uint32_t cap = max(RP_CHUNK_SIZE, min_size);
++    uint32_t cap = exact ? min_size : max(RP_CHUNK_SIZE, min_size);
+ 
+     if (cap == RP_CHUNK_SIZE)
+     {
+         pthread_mutex_lock(&rp.lock);
+         if ((k = rp.free))
++        {
+             rp.free = k->next;
++            rp.free_count--;
++        }
+         pthread_mutex_unlock(&rp.lock);
+     }
+     if (!k && !(k = vkd3d_malloc(sizeof(*k) + cap)))
+@@ -147,9 +152,15 @@ static void rp_chunk_put(struct rp_chunk *k)
+         return;
+     }
+     pthread_mutex_lock(&rp.lock);
+-    k->next = rp.free;
+-    rp.free = k;
++    if (rp.free_count < RP_FREE_MAX)
++    {
++        k->next = rp.free;
++        rp.free = k;
++        rp.free_count++;
++        k = NULL;
++    }
+     pthread_mutex_unlock(&rp.lock);
++    vkd3d_free(k);
+ }
+ 
+ static uint64_t rp_publish_chunk(struct rp_chunk *k)
+@@ -199,7 +210,7 @@ static struct rp_chunk *rp_defer_chunk(void (*replay)(VkCommandBuffer, const str
+     if (__atomic_load_n(&rp.done, __ATOMIC_ACQUIRE) >= __atomic_load_n(&rp.published, __ATOMIC_ACQUIRE))
+         return NULL;
+     size = align(size, 16);
+-    if (!(k = rp_chunk_get(VK_NULL_HANDLE, size)))
++    if (!(k = rp_chunk_get(VK_NULL_HANDLE, size, true)))
+         return NULL;
+     op = (struct rp_op *)k->data;
+     op->replay = replay;
+@@ -262,7 +273,7 @@ static void *rp_op_alloc(struct rp_cb *c, void (*replay)(VkCommandBuffer, const
+         rp_publish(c);
+         k = NULL;
+     }
+-    if (!k && !(k = c->chunk = rp_chunk_get(c->vk_cb, size)))
++    if (!k && !(k = c->chunk = rp_chunk_get(c->vk_cb, size, false)))
+     {
+         ERR("cmdreplay: out of memory.\n");
+         abort();
+@@ -469,6 +480,8 @@ void vkd3d_cmd_replay_register_pool(VkCommandPool vk_pool)
+     pthread_mutex_unlock(&rp.pool_lock);
+ }
+ 
++static void rp_pool_unlink(struct rp_pool *pool, struct rp_cb *c);
++
+ static VKAPI_ATTR VkResult VKAPI_CALL rp_vkAllocateCommandBuffers(VkDevice device,
+         const VkCommandBufferAllocateInfo *info, VkCommandBuffer *cbs)
+ {
+@@ -493,7 +506,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL rp_vkAllocateCommandBuffers(VkDevice devic
+             for (j = 0; j < i; j++)
+             {
+                 c = RP_CB(cbs[j]);
+-                pool->cbs = c->pool_next;
++                rp_pool_unlink(pool, c);
+                 cbs[j] = c->vk_cb;
+                 vkd3d_free(c);
+             }
+@@ -599,6 +612,13 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyCommandPool(VkDevice device, VkCom
+     }
+ }
+ 
++static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *allocator)
++{
++    /* Queued destroys run before the device goes. */
++    rp_guard();
++    rp_real.vkDestroyDevice(device, allocator);
++}
++
+ /* Submission */
+ 
+ static uint64_t rp_untag(VkCommandBuffer *cb)
+@@ -1217,6 +1237,48 @@ static void rp_replay_push_descriptors(VkCommandBuffer cb, const struct rp_op *h
+     rp_real.vkCmdPushDescriptorSetKHR(cb, op->bind_point, op->layout, op->set, op->count, op->writes);
+ }
+ 
++/* The array a write's descriptorType reads; the others may be left pointing anywhere. */
++static const VkDescriptorImageInfo *rp_write_images(const VkWriteDescriptorSet *w)
++{
++    switch (w->descriptorType)
++    {
++        case VK_DESCRIPTOR_TYPE_SAMPLER:
++        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
++        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
++        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
++        case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
++            return w->pImageInfo;
++        default:
++            return NULL;
++    }
++}
++
++static const VkDescriptorBufferInfo *rp_write_buffers(const VkWriteDescriptorSet *w)
++{
++    switch (w->descriptorType)
++    {
++        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
++        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
++        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
++        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
++            return w->pBufferInfo;
++        default:
++            return NULL;
++    }
++}
++
++static const VkBufferView *rp_write_texels(const VkWriteDescriptorSet *w)
++{
++    switch (w->descriptorType)
++    {
++        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
++        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++            return w->pTexelBufferView;
++        default:
++            return NULL;
++    }
++}
++
+ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
+         VkPipelineBindPoint bind_point, VkPipelineLayout layout, uint32_t set, uint32_t count,
+         const VkWriteDescriptorSet *writes)
+@@ -1241,9 +1303,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushDescriptorSetKHR(VkCommandBuffer c
+                     count, writes);
+             return;
+         }
+-        size += RP_ARRAY_SIZE(writes[i].pImageInfo, writes[i].descriptorCount)
+-                + RP_ARRAY_SIZE(writes[i].pBufferInfo, writes[i].descriptorCount)
+-                + RP_ARRAY_SIZE(writes[i].pTexelBufferView, writes[i].descriptorCount);
++        size += RP_ARRAY_SIZE(rp_write_images(&writes[i]), writes[i].descriptorCount)
++                + RP_ARRAY_SIZE(rp_write_buffers(&writes[i]), writes[i].descriptorCount)
++                + RP_ARRAY_SIZE(rp_write_texels(&writes[i]), writes[i].descriptorCount);
+     }
+     op = rp_op_alloc(c, rp_replay_push_descriptors, sizeof(*op) + count * sizeof(*writes) + 16 + size);
+     op->bind_point = bind_point;
+@@ -1255,9 +1317,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushDescriptorSetKHR(VkCommandBuffer c
+     payload += (uintptr_t)-(uintptr_t)payload & 15;
+     for (i = 0; i < count; i++)
+     {
+-        RP_ARRAY(op->writes[i].pImageInfo, writes[i].pImageInfo, writes[i].descriptorCount);
+-        RP_ARRAY(op->writes[i].pBufferInfo, writes[i].pBufferInfo, writes[i].descriptorCount);
+-        RP_ARRAY(op->writes[i].pTexelBufferView, writes[i].pTexelBufferView, writes[i].descriptorCount);
++        RP_ARRAY(op->writes[i].pImageInfo, rp_write_images(&writes[i]), writes[i].descriptorCount);
++        RP_ARRAY(op->writes[i].pBufferInfo, rp_write_buffers(&writes[i]), writes[i].descriptorCount);
++        RP_ARRAY(op->writes[i].pTexelBufferView, rp_write_texels(&writes[i]), writes[i].descriptorCount);
+     }
+ }
+ 
+@@ -1385,9 +1447,32 @@ void vkd3d_cmd_replay_install(struct d3d12_device *device)
+         }
+         INFO("cmdreplay: command lists record through the replay worker.\n");
+     }
++    else
++    {
++        /* Another device (games create a throwaway one first): fill what the first one lacked. The
++         * winevulkan entry points are the same functions for every device. */
++        const PFN_vkVoidFunction *src = (const PFN_vkVoidFunction *)&device->vk_procs;
++        PFN_vkVoidFunction *dst = (PFN_vkVoidFunction *)&rp_real;
++        size_t i;
++
++        for (i = 0; i < sizeof(rp_real) / sizeof(*dst); i++)
++        {
++            if (!dst[i])
++                dst[i] = src[i];
++            else if (src[i] && src[i] != dst[i])
++                WARN("cmdreplay: device entry point %zu differs from the first device's.\n", i);
++        }
++    }
+     rp_install_procs(&device->vk_procs);
+ }
+ 
++/* For code outside vkd3d that records into a list's command buffer itself (interop): the worker
++ * replays everything recorded so far, then the caller gets the real handle. */
++VkCommandBuffer vkd3d_cmd_replay_direct_handle(VkCommandBuffer cb)
++{
++    return RP_TAGGED(cb) ? rp_drain_for_direct(RP_CB(cb), RP_HAND_EXEC) : cb;
++}
++
+ bool vkd3d_cmd_replay_enabled(void)
+ {
+     return !!rp_state;
+diff --git a/libs/vkd3d/cmdreplay_gen.h b/libs/vkd3d/cmdreplay_gen.h
+index c7ed71be..b4fbab53 100644
+--- a/libs/vkd3d/cmdreplay_gen.h
++++ b/libs/vkd3d/cmdreplay_gen.h
+@@ -1015,7 +1015,8 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyEvent(VkDevice device, VkEvent eve
+ 
+ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* pAllocator)
+ {
+-    rp_guard();
++    if (fence)
++        rp_guard();
+     rp_real.vkDestroyFence(device, fence, pAllocator);
+ }
+ 
+@@ -1145,7 +1146,8 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyPipeline(VkDevice device, VkPipeli
+ 
+ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyPipelineCache(VkDevice device, VkPipelineCache pipelineCache, const VkAllocationCallbacks* pAllocator)
+ {
+-    rp_guard();
++    if (pipelineCache)
++        rp_guard();
+     rp_real.vkDestroyPipelineCache(device, pipelineCache, pAllocator);
+ }
+ 
+@@ -1244,7 +1246,8 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroySampler(VkDevice device, VkSampler
+ 
+ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroySemaphore(VkDevice device, VkSemaphore semaphore, const VkAllocationCallbacks* pAllocator)
+ {
+-    rp_guard();
++    if (semaphore)
++        rp_guard();
+     rp_real.vkDestroySemaphore(device, semaphore, pAllocator);
+ }
+ 
+@@ -1281,44 +1284,15 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyShaderModule(VkDevice device, VkSh
+ 
+ static VKAPI_ATTR VkResult VKAPI_CALL rp_vkFreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool, uint32_t descriptorSetCount, const VkDescriptorSet* pDescriptorSets)
+ {
+-    rp_guard();
++    if (descriptorPool)
++        rp_guard();
+     return rp_real.vkFreeDescriptorSets(device, descriptorPool, descriptorSetCount, pDescriptorSets);
+ }
+ 
+-struct rp_op_vkFreeMemory
+-{
+-    struct rp_op h;
+-    VkDevice device;
+-    VkDeviceMemory memory;
+-    const VkAllocationCallbacks *pAllocator;
+-};
+-
+-static void rp_replay_vkFreeMemory(VkCommandBuffer cb, const struct rp_op *h)
+-{
+-    const struct rp_op_vkFreeMemory *op = (const void *)h;
+-    rp_real.vkFreeMemory(op->device, op->memory, op->pAllocator);
+-}
+-
+-static VKAPI_ATTR void VKAPI_CALL rp_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator)
+-{
+-    struct rp_op_vkFreeMemory *op;
+-    struct rp_chunk *k;
+-
+-    if (!memory || !(k = rp_defer_chunk(rp_replay_vkFreeMemory, sizeof(*op))))
+-    {
+-        rp_real.vkFreeMemory(device, memory, pAllocator);
+-        return;
+-    }
+-    op = (void *)k->data;
+-    op->device = device;
+-    op->memory = memory;
+-    op->pAllocator = pAllocator;
+-    rp_publish_chunk(k);
+-}
+-
+ static VKAPI_ATTR VkResult VKAPI_CALL rp_vkResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, VkDescriptorPoolResetFlags flags)
+ {
+-    rp_guard();
++    if (descriptorPool)
++        rp_guard();
+     return rp_real.vkResetDescriptorPool(device, descriptorPool, flags);
+ }
+ 
+@@ -1897,7 +1871,8 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawMeshTasksIndirectCountEXT(VkComman
+ 
+ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAllocator)
+ {
+-    rp_guard();
++    if (swapchain)
++        rp_guard();
+     rp_real.vkDestroySwapchainKHR(device, swapchain, pAllocator);
+ }
+ 
+@@ -2310,6 +2285,8 @@ static const char *const rp_drain_names[] =
+ 
+ static void rp_install_procs(struct vkd3d_vk_device_procs *vk)
+ {
++    if (vk->vkDestroyDevice)
++        vk->vkDestroyDevice = rp_vkDestroyDevice;
+     if (vk->vkAllocateCommandBuffers)
+         vk->vkAllocateCommandBuffers = rp_vkAllocateCommandBuffers;
+     if (vk->vkBeginCommandBuffer)
+@@ -2458,8 +2435,6 @@ static void rp_install_procs(struct vkd3d_vk_device_procs *vk)
+         vk->vkFreeCommandBuffers = rp_vkFreeCommandBuffers;
+     if (vk->vkFreeDescriptorSets)
+         vk->vkFreeDescriptorSets = rp_vkFreeDescriptorSets;
+-    if (vk->vkFreeMemory)
+-        vk->vkFreeMemory = rp_vkFreeMemory;
+     if (vk->vkQueueSubmit2)
+         vk->vkQueueSubmit2 = rp_vkQueueSubmit2;
+     if (vk->vkResetCommandBuffer)
+diff --git a/libs/vkd3d/cmdreplay_gen.py b/libs/vkd3d/cmdreplay_gen.py
+index b843a0d9..7b5544ff 100644
+--- a/libs/vkd3d/cmdreplay_gen.py
++++ b/libs/vkd3d/cmdreplay_gen.py
+@@ -40,8 +40,10 @@ for ret, name, params in re.findall(r"VKAPI_ATTR (\w+) VKAPI_CALL (vk\w+)\(\s*(.
+ # Types through which a command buffer handle can reach a function.
+ CB_TYPES = ("VkCommandBuffer", "VkSubmitInfo", "VkSubmitInfo2", "VkCommandBufferSubmitInfo",
+             "VkDebugUtilsObjectNameInfoEXT", "VkDebugUtilsObjectTagInfoEXT")
++# vkFreeMemory is left alone: memory is freed only once the GPU is done with it, so every op naming
++# it was replayed before its submission, and holding it back would keep VRAM from the next allocation.
+ GUARDED = lambda n: (n.startswith(("vkDestroy", "vkFree")) or n == "vkResetDescriptorPool") and n not in (
+-    "vkDestroyDevice", "vkDestroyCommandPool", "vkFreeCommandBuffers")
++    "vkDestroyDevice", "vkDestroyCommandPool", "vkFreeCommandBuffers", "vkFreeMemory")
+ 
+ 
+ # Destroys of the form (device, handle, pAllocator) are queued behind the published ops instead of
+@@ -65,6 +67,8 @@ out = ["/* Generated by cmdreplay_gen.py from vulkan_core.h and vulkan_procs.h;
+ installs, drains, missing = [], [], []
+ for name in device_fns:
+     if name not in protos:
++        if name.startswith("vkCmd") or name in hand:
++            missing.append(name + " (no prototype in vulkan_core.h)")
+         continue
+     ret, plist = protos[name]
+     sees_cb = any(any(re.search(rf"\b{t}\b", p[0]) for t in CB_TYPES) for p in plist)
+@@ -119,8 +123,8 @@ for name in device_fns:
+     elif GUARDED(name):
+         args = ", ".join(n for _, n, _ in plist)
+         out.append(f"static VKAPI_ATTR {ret} VKAPI_CALL rp_{name}({decl(plist)})\n{{\n"
+-                   f"    rp_guard();\n"
+-                   f"    {'return ' if ret != 'void' else ''}rp_real.{name}({args});\n}}\n")
++                   + (f"    if ({plist[1][1]})\n        rp_guard();\n" if by_value(plist[1][0], plist[1][2]) else "    rp_guard();\n")
++                   + f"    {'return ' if ret != 'void' else ''}rp_real.{name}({args});\n}}\n")
+         installs.append(name)
+ 
+ if missing:
+diff --git a/libs/vkd3d/command_list_vkd3d_ext.c b/libs/vkd3d/command_list_vkd3d_ext.c
+index d91a42e8..9b5ab3db 100644
+--- a/libs/vkd3d/command_list_vkd3d_ext.c
++++ b/libs/vkd3d/command_list_vkd3d_ext.c
+@@ -60,7 +60,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_vkd3d_ext_GetVulkanHandle(d3
+     if (!pVkCommandBuffer)
+         return E_INVALIDARG;
+ 
+-    *pVkCommandBuffer = command_list->cmd.vk_command_buffer;
++    /* miles-bench: outside code records into the real buffer directly (cmdreplay.c). */
++    *pVkCommandBuffer = vkd3d_cmd_replay_direct_handle(command_list->cmd.vk_command_buffer);
+     /* TODO: Do we need to block any attempt to split command buffers here?
+      * Might be a problem if DLSS implementation caches the VkCommandBuffer across DLSS invocations. */
+     return S_OK;
+diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
+index 94818b9a..dc8575d9 100644
+--- a/libs/vkd3d/device_vkd3d_ext.c
++++ b/libs/vkd3d/device_vkd3d_ext.c
+@@ -1078,7 +1078,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_BeginVkCommandBufferI
+     d3d12_command_list_decay_tracked_state(cmd_list);
+     d3d12_command_list_invalidate_all_state(cmd_list);
+ 
+-    *cmdBuf = cmd_list->cmd.vk_command_buffer;
++    /* miles-bench: outside code records into the real buffer directly (cmdreplay.c). */
++    *cmdBuf = vkd3d_cmd_replay_direct_handle(cmd_list->cmd.vk_command_buffer);
+ 
+     return S_OK;
+ }
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 97876ed7..f7deb9fa 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -7478,6 +7478,7 @@ void vkd3d_cmd_replay_install(struct d3d12_device *device);
+ void vkd3d_cmd_replay_register_pool(VkCommandPool vk_pool);
+ void vkd3d_cmd_replay_report(void);
+ bool vkd3d_cmd_replay_enabled(void);
++VkCommandBuffer vkd3d_cmd_replay_direct_handle(VkCommandBuffer cb);
+ void vkd3d_gputime_present(void);
+ void vkd3d_gputime_note(VkCommandBuffer cmd, const char *fmt, ...);
+ void vkd3d_gputime_ecl(VkCommandBuffer cmd);

@@ -5,12 +5,13 @@ it draws. The machine is a GTX 1060 3 GB, an i5-4670 and 7.7 GiB of RAM; the gam
 GTX 1060 6 GB and 16 GB. The game runs through Proton, and every change here lives in
 vkd3d-proton, the layer that translates its Direct3D 12 calls to Vulkan. No setting is lowered and
 no frame is drawn differently: each change is checked against the unpatched build. It is built
-for the game's launch build, `MilesMorales.exe` 1.1116.0.0 ([Using S16](#using-s16)).
+for the game's launch build, `MilesMorales.exe` 1.1116.0.0 ([Using S17](#using-s17)).
 
 ## Results
 
 The Rhino fight, played by injected keys from its start to the game's 3rd autosave request, at the
-same graphics settings, unpatched against the current build (S16):
+same graphics settings, unpatched against S16, the last step measured in the fight (S17 changes
+only the open world and leaves the fight as it was):
 
 | | Unpatched (S0) | S16 | |
 |---|---:|---:|---|
@@ -36,6 +37,13 @@ with launches of the step before in the same series, which is the fair compariso
 | S14 | Index cache eviction fix | SSD | 12 | 43.3 | 15 | 5.3 | 1,963 | +0.48% (v16, 4 + 4) |
 | S15 | Clear keep | SSD | 16 | 44.0 | 14 | 5.3 | 1,955 | +3.12% (v18, v19, 8 + 8) |
 | S16 | Render-thread CPU cuts | SSD | 8 | 44.1 | 14 | 5.5 | 1,941 | +1.22% (v21, v22, 8 + 8) |
+| S17 | Open-world index cache | SSD | — | — | — | — | — | not in the fight bench: changes the open world only |
+
+S17 changes only the open world. Swinging there with the game uncapped, whole launches of S17
+with the `scx_bpfland` scheduler (how `bench/play.sh` plays it) against S16: 48.0 against 46.6 fps
+(+3.0%), frames over 40 ms 5.2 against 12.6 a minute (−59%), frames over 50 ms 1.0 against 2.4 a
+minute. Launches spread several fps on the same build; switched live inside one game, S17's index
+cache gave +4.5% fps and `scx_bpfland` cut slow frames by about 60%.
 
 Only the last column isolates a step. The disk, the desktop's video memory and the hidden game
 window also move the absolute figures; [docs/method.md](docs/method.md) explains how a launch is
@@ -53,8 +61,8 @@ step changes and where. The dashboard charts every launch behind these tables:
 | `dashboard/` | The dashboard page (`index.html`, drawn from the tables in `data/`) and `preview.py`, which renders it locally. |
 | `docs/` | How the bench measures, and what each checkpoint changes. |
 | `NOTES.md` | The lab notebook: every finding, measurement and dead end, in the order they happened. |
-| `saves/` | Save snapshots the bench loads: `warehouse` (the Rhino fight) and `user-1013` (the Rhino chase). |
-| `tools/` | `fork.sh`, and the Ghidra client and analysis options used for the reverse engineering. |
+| `saves/` | Save snapshots the bench loads: `warehouse` (the Rhino fight), `user-1013` (the Rhino chase), `swing-1017` and `user-1017` (the open world). |
+| `tools/` | `fork.sh`; `miles-session` (runs `scx_bpfland` for the length of a play session) and its installer; `gpuclk.py` (NVML clock offsets, measured and not used); the Ghidra client and analysis options used for the reverse engineering. |
 | `tests/` | A smoke test of the allocation tracer. |
 | `flake.nix` | The Nix dev shell: mingw-w64 cross compiler, meson, ninja, glslang, Wine (for widl), Ghidra, Python. |
 
@@ -64,12 +72,12 @@ its publisher; `tools/ghidra-client/dc.sh` writes the decompilations), `build/`,
 install under `tools/`, and `learned/`, the sizes this machine's sessions learned (every machine
 learns its own). The tables in `data/` are rebuilt from the captures by
 `bench/datasets.py`. The built DLLs of the current checkpoint are attached to the
-`checkpoint-s16` release, with their SHA-256 sums; `tools/fork.sh` tags every checkpoint in the
+`checkpoint-s17` release, with their SHA-256 sums; `tools/fork.sh` tags every checkpoint in the
 fork it rebuilds.
 
-## Using S16
+## Using S17
 
-S16 is built for `MilesMorales.exe` **1.1116.0.0**, the game's November 2022 launch build. Five of
+S17 is built for `MilesMorales.exe` **1.1116.0.0**, the game's November 2022 launch build. Five of
 its patches work on the game's own code and data (page drops, geometry decoding, the index cache,
 the sparse light grid and skinning buffers): they check the exe and stay off on any other build,
 and no later build has been tried. It was measured with GE-Proton11-5, whose vkd3d-proton is the
@@ -77,7 +85,7 @@ fork's base, on an NVIDIA GTX 1060 3 GB. Every feature first checks that it can 
 game build, a separate GPU, sparse buffers) and keeps vkd3d-proton's stock behaviour where a check
 fails.
 
-1. Get `d3d12.dll` and `d3d12core.dll`: from the `checkpoint-s16` release, or build them (below).
+1. Get `d3d12.dll` and `d3d12core.dll`: from the `checkpoint-s17` release, or build them (below).
 2. Copy both next to `MilesMorales.exe`. Deleting them goes back to stock vkd3d-proton.
 3. Switch the features on with environment variables, for example as Steam launch options:
 
@@ -94,6 +102,12 @@ session has nothing to go on: it runs those three as stock and measures, and the
 use what it measured. The file goes in the directory the game starts in (normally its own
 folder), or in `VKD3D_BENCH_LEARNED_PATH`.
 
+On Linux with a sched_ext kernel, the `scx_bpfland` CPU scheduler during play halved the slow
+frames while swinging through the open world in A/B within one game (NOTES.md, 2026-10-21). It is
+not part of the DLLs: `bench/play.sh` starts it with the game and stops it at exit through
+`tools/miles-session` (`sudo tools/install-miles-session.sh` installs it with a sudo rule for just
+that). Running `scx_bpfland` by hand for the session does the same.
+
 To check that it is on, run once with `VKD3D_DEBUG=info` added: vkd3d-proton's log (on Steam,
 `PROTON_LOG=1` writes it to `~/steam-<appid>.log`) then has an `engine patch:` or `bench:` line for
 each feature it switched on. `engine patch: exe timestamp ... is not the known build` means the
@@ -107,7 +121,7 @@ apply (mingw-w64, meson, ninja, glslang, widl); that route is untested here.
 
 ```sh
 tools/fork.sh                                    # src/vkd3d-proton: upstream 731c4aae + patches/, checked by hash
-git -C src/vkd3d-proton checkout checkpoint-s16  # S16 itself; the branch adds diagnostics that are off unless enabled
+git -C src/vkd3d-proton checkout checkpoint-s17  # S17 itself (the tip of the series today)
 nix develop --command bash -c '
   meson setup --cross-file "$MILES_CROSS_FILE" -Dbuildtype=release -Denable_trace=false \
     -Dc_args=-Wno-error=incompatible-pointer-types \
@@ -115,7 +129,7 @@ nix develop --command bash -c '
   ninja -C build/memtrace install'
 ```
 
-The DLLs land in `build/memtrace/install/bin` and should match the `checkpoint-s16` release byte
+The DLLs land in `build/memtrace/install/bin` and should match the `checkpoint-s17` release byte
 for byte: check them against its `SHA256SUMS` (independent builds from fresh clones here did).
 
 ## Running the bench

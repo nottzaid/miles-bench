@@ -1,0 +1,13 @@
+lever,scene,run,metric,without,with,change,outcome
+Index cache mirroring (S17),"Open world, standing, uncapped (swing-1017 save)",st-ic1,fps,55.48,58.01,+4.6%,Kept: S17
+Index cache mirroring (S17),"Open world, standing, uncapped (the user's save)",st-ic2,fps,59.15,61.84,+4.5%,Kept: S17
+scx_bpfland,"Open world, swinging, uncapped",tr-bpf1,frames over 40 ms per minute,10.4,3.7,-64%,Kept: play sessions
+scx_bpfland,"Open world, swinging, uncapped",tr-bpf1,fps,47.89,50.10,+4.6%,Kept: play sessions
+scx_bpfland,"Open world, swinging, uncapped",tr-bpf2,frames over 40 ms per minute,16.2,6.2,-62%,Kept: play sessions
+scx_bpfland,"Open world, swinging, uncapped",tr-bpf2,fps,44.47,45.59,+2.5%,Kept: play sessions
+scx_bpfland,"Open world, standing, uncapped",st-bpf1,p99 frame time (ms),21.1,18.0,-3.1 ms,Kept: play sessions
+scx_cosmos,"Open world, swinging, uncapped",tr-cosmos1,frames over 40 ms per minute,30.4,10.8,-64%,"Not chosen: one session, bpfland measured in more"
+scx_lavd --performance,"Open world, swinging, uncapped",tr-lavd1,frames over 40 ms per minute,8.3,9.2,+11%,Dropped
+Deferred command recording,"Open world, standing, uncapped",st-rp1,fps,60.7,60.1,-1.0%,"Dropped (in the build, off): its worker thread takes a core the game needs"
+GPU offsets +100 / +250,"Warehouse fight, uncapped",wh-gpu1,fps,59.00,60.91,+3.2%,Dropped: see +150 / +500
+GPU offsets +150 / +500,"Warehouse fight, uncapped",wh-gpu2,fps,58.40,61.35,+5.1%,Dropped: lost the GPU in the open world (oc-ow-1) and crashed the desktop

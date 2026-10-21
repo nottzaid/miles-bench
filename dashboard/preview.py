@@ -9,7 +9,7 @@ import csv, json, os, sys
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 page, d = os.path.join(root, 'dashboard', 'index.html'), os.path.join(root, 'data')
 out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, 'build', 'dashboard-preview.html')
-names = ['launches', 'steps', 'gpu_frame', 'gaming_mode', 'headroom', 'vram', 'static_scene', 'chase']
+names = ['launches', 'steps', 'gpu_frame', 'gaming_mode', 'headroom', 'vram', 'static_scene', 'chase', 's17_launches', 's17_levers']
 data = {n: list(csv.DictReader(open(f'{d}/{n}.csv'))) for n in names}
 mock = """
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>

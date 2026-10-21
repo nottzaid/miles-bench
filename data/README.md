@@ -32,6 +32,8 @@ Inputs: `runs.csv` (capture, step, disk, whether it goes in the VRAM table) and 
 | `gpu_frame.csv` | Average GPU time per frame by kind of segment at S15 | `bench/gputime.py` on v20-S15-gt |
 | `static_scene.csv` | The static scene, two rounds per arm, unpatched to S5 | series v6-prog |
 | `chase.csv` | Shader compiling and missing-lighting submissions in the first 150 s of the chase | psoA/B/P/Q and ssd1-3 captures |
+| `s17_launches.csv` | Whole launches for S17, uncapped: the open world (swinging on the circle route, about 130 s) and the warehouse fight, per build, scheduler and GPU offsets; `in_means` 0 leaves a launch out of the means (the one that crashed) | cb-ow, cb-wh, wh, oc captures; NOTES.md, S17 |
+| `s17_levers.csv` | Settings switched back and forth inside one running game around S17: without, with, change, outcome | NOTES.md, 2026-10-21 |
 
 The figures in `headroom.csv` that come from launches (GPU busy, pinned RAM, VRAM) are the means of
 `launches.csv` and `vram.csv` for S16; the rest cite the capture they come from.

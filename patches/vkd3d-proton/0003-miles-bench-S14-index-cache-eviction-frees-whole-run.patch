@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Zaid <nottzaid@tutamail.com>
 Date: Thu, 15 Oct 2026 07:01:25 +0300
-Subject: [PATCH 3/7] miles-bench S14: index cache eviction frees whole runs
+Subject: [PATCH 03/12] miles-bench S14: index cache eviction frees whole runs
 
 idxc_alloc_locked compared run_of[i] against the run being evicted while
 clearing it, so only part of each evicted run was freed: the rest stayed

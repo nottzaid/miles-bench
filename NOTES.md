@@ -1240,3 +1240,186 @@ Started from the question why frames over 100 ms rose from 5.0 (S8) to 7.0 (S16)
   vkd3d's build id (vkd3d_build, which keys its pipeline cache). A rebuild from a checkpoint commit
   gets that commit's new hash as its id, so vkd3d's pipeline cache starts over once.
 
+
+## 2026-10-20: S17 dev, driven open world (swing-1017 save), hitch causes
+- Driver: saves/swing-1017 (post skill-tree tutorial) + a swing loop of hyprbench `hold` steps
+  (W+Shift swings, A/D turns, Space, X). benchinput `hold` now repeats key-down every 30 ms (the
+  skill tree's hold-to-unlock needs it). The game polls XInput only after it enumerates a
+  controller, so the virtual pad (`pad`) is not used.
+- Warm caches, S17 dev, 240 s swinging (s17-explore4): 43.5 fps, p95 33.3 ms, 39 frames > 50 ms,
+  fps per 10 s 36-56, VRAM 2926/3072 MiB. Slow frames: first-ever PSO compiles on the render
+  thread (13, avg 139 ms), bursts of 2-11 ms sysmem vkAllocateMemory (12), render-thread CPU-heavy
+  frames with a flat profile (14).
+- The 5.4 s periodic hitch in play-1017-0205 only exists at 50-150 s: game activity, not a timer.
+- GPL probe (VKD3D_BENCH_GPL_PROBE, cold-mono vs cold-gpl, empty NVIDIA cache, vkd3d cache off):
+  on 580.178 the library build costs as much as the monolithic compile (334 vs 388 s over 2587
+  PSOs); fast link and LTO link ~0.02 ms. GPL alone does not hide cold compiles. Dropped.
+- pso firstbind (cold-3): 1099 of 1206 slow-compiled PSOs are first bound > 1 s after creation
+  (median ~283 s). They are compiled by the game's four PSO worker threads (~113 s each when cold);
+  only ~32 slow ones are created on the render thread and bound at once. The worker compiles
+  overlap most slow frames: 4 compile threads on a 4-core CPU starve the main/render threads.
+  Tried (cold-4): vkCreate*Pipelines at THREAD_PRIORITY_IDLE on threads other than the presenting
+  one. Proton maps it to nice (the "Pipeline creation" threads went to nice 11; the game runs its
+  own threads at nice -5). Worse: compile-caused slow frames averaged 442 ms (cold-3: 218 ms) and
+  worker compile overlap of slow frames rose to 0.57 busy threads per frame-ms (cold-3: 0.31,
+  normal frames ~0). The game waits for its workers' PSOs; slower workers lengthen the wait, so
+  the stalls are compile latency, not CPU contention. Reverted.
+- Slow allocations (cold-3): 790 are the game's small CUSTOM (L0) texture heaps in sysmem
+  (heap type 4, flags 0x44, 13 KiB-2.9 MiB), 323 dedicated committed textures falling back to
+  sysmem, ~200 VRAM heaps. Next: sub-allocate small texture heaps from chunks (pool), so a spill
+  is not a 2-11 ms driver allocation on the frame.
+- GPU: 1898 MHz, 79 C, SW power cap hit only 9 s in total; raising the power limit (120 -> 140 W)
+  would barely help. Clock offsets via NVML are the remaining GPU lever.
+- Warm driven runs (warmdrive: swing-1017, 200 s): warm-A 49.1 fps but a 9.2 s frame (worker
+  compiles of 1-2.7 s at load: pipelines new to the game-folder NVIDIA cache, since this save's
+  location was never loaded on that cache before); warm-C (same, second time) 43.9 fps, p95 32.1,
+  8 frames > 50 ms (4 compiles, 3 plain, 1 allocation), 32 of warm-A's 36 slow PSOs served from
+  cache (median 9.5 ms). The cache (one 255 MB .bin) is not being evicted; no size override needed.
+- Memory domains (NVIDIA 580, GTX 1060): buffers 0x781, textures 0x82, render targets 0x80;
+  sysmem fallback buffers 0x301, textures 0x2, render targets none. So vkd3d reports resource heap
+  tier 1, the game makes per-category heaps, and vkd3d never sub-allocates image heaps.
+- Tried: VKD3D_BENCH_TEXHEAP_POOL, small sampled-texture heaps sub-allocated from chunks at tier 1.
+  First version crashed in the driver: at tier 1 a DENY_BUFFERS chunk gets no global buffer, and the
+  zero-fill used a null buffer. Fixed, then warm-B3: 29.9 fps, 2069 slow allocations in the window
+  (warm-C ~200), 3351 pool fallbacks, VRAM 3003 MiB. Partly used 16 MiB VRAM chunks push other
+  resources out to system memory, and sysmem texture chunks cannot carry the clearing buffer
+  (type 1 takes no buffers). Reverted. In warm sessions allocations are rarely in slow frames anyway.
+- Next: warm open-world throughput (43.9 fps average, 10 s windows 38-51) is the main gap.
+
+## 2026-10-21: S17 dev, system levers, memory, deferred command recording
+
+- Loop route for A/B (scratchpad circledrive.sh: `hold 8000 w shift d`, `space`): circles the same
+  blocks at 44-55 fps, but can still end against a wall (60 fps cap, useless) after minutes. Live
+  toggles in 12 s segments (livetoggle.sh) compare system settings inside one game.
+- System levers, live A/B in one game: performance governor ~= schedutil (clocks average 3554 MHz
+  while swinging; the i5-4670's 4-core turbo is 3.6 GHz, so nothing to gain); `scx_lavd
+  --performance` 48.7 vs 47.7 fps, >40 ms frames 4.9 vs 7.6/min (small, one run); GPU +100 MHz
+  core / +250 NVML memory (= +500 MHz in Afterburner terms): no gain in 8 usable pairs (46.4 vs
+  47.4). The GPU is not the limit while swinging; the render thread is.
+- Memory: the bench game runs with ~130 MB free. The game's own memory is 2.4-3 GB of which 1.8-2.3
+  GB sits in zram; the driver pins ~2.2 GB of GPU allocations in system RAM (type 8 host-visible
+  1148 MiB, incl. the 800 MiB geometry heap, of which 662 MiB was written within minutes; type 1
+  texture spill 926 MiB), since the desktop holds ~500 MiB of VRAM (Hyprland 224, noctalia 213,
+  kitty 60). Major faults while swinging: 89% on the Asset Load Thread (streaming), main ~76/s,
+  render thread 0. Real play runs under gaming mode (~/.local/bin/gaming-mode: shell stopped,
+  terminals closed, apps frozen and swapped out), bench runs do not (the game is on a hidden
+  workspace); forcing it on re-reads the Hyprland config, which resets render_unfocused_fps to 15
+  (rerun `hyprbench.py setup` after).
+- Render thread (perf LBR, 31k samples): 15.3% libnvidia-glcore, 13.5% d3d12core, ~5% Wine/libc
+  around the driver calls, 6.8% the game's pause backoff (0x20c6840) called only from the occlusion
+  query finalize spin (0x1d98783, see 2026-10-11): ~20% of the critical thread is driver recording.
+- Deferred command recording (fork cmdreplay.c, `VKD3D_BENCH_CMD_REPLAY=1`, config s17-rp): command
+  lists' command buffers record into per-buffer op streams; one worker thread replays them into the
+  driver. Wrappers for every device function that can see a command buffer are generated
+  (cmdreplay_gen.py); pool operations, submission and destroys order themselves after the worker.
+  First run: no errors over minutes of open world, 115-296k ops/s replayed, only
+  vkCmdSetDepthBias2EXT goes direct (9 calls). Clean-slate review (opus): no crash path for this
+  game; fixed interop handles, per-device entry points, vkDestroyDevice ordering, destroy chunk
+  size, NULL-handle guards (vkDestroyPipelineCache(NULL) per PSO release), vkFreeMemory left
+  unqueued (VRAM back at once). Baseline for the A/B (rpA-1, s17-dev, loop route 88 s): 48.70 fps,
+  p95 27.6 ms, render thread 16.3 ms/frame, main 15.7. The replay run (rpB-1) was stopped by Claude
+  Code's low-memory guard before it measured.
+- Deferred command recording, continued. Guard waits were pool operations waiting for every
+  published chunk: now they wait only for their own pool's last chunk (plus vkCmdExecuteCommands
+  chunks when the pool has secondaries), and render-thread guard waits went to zero. Feature bit
+  0x2000 (REPLAY_OFF) switches pools to direct recording at their next reset, so replay can be A/B'd
+  in one game. Result: no gain. Circling sessions (rpT-1..3) are noise (12 usable pairs average
+  +0.1 fps, single windows 38-55 fps); standing with VSync off (st-rp1, 12 ABBA pairs): replay on
+  60.1 fps vs off 60.7, p95 19.6 vs 18.8 ms. The render thread saves ~1-1.6 ms/frame, but the worker
+  spends ~5 ms/frame of a fourth core the game's job threads need. Kept off (fork 93e5d388).
+- Measuring method. Launch-to-launch spread on the circle route is +-4 fps and 4-15 s windows
+  inside one session spread +-20%, so circling A/Bs cannot resolve a few percent. Standing still in
+  the open world with the bench prefix's VSync off (registry `VSync`=0 for the run only; the game is
+  not capped then: 13% of frames under 15 ms) gives +-0.3-0.6 fps per window. Circling uncapped
+  with 15 s live-toggle segments still resolves tail changes (frames > 40 ms per minute).
+- S17's index cache (mirrors GPU writes instead of turning itself off) vs off, same session
+  (feature 0x8), standing, VSync off: swing-1017 58.01 vs 55.48 fps (st-ic1), user-1017 61.84 vs
+  59.15 (st-ic2, 10 pairs, -4.35% +- 0.35 off). S16 turns the cache off in the open world (the
+  user's play-1017-0205 log: "CopyBufferRegion writes the geometry heap"), so this is S17's gain
+  over S16 there. s17-verify2: 4.3M cached draws compared byte for byte, 0 differ.
+- Schedulers (live toggle, s17-dev, VSync off):
+  | Run | Scene | stock | sched_ext | tails |
+  |---|---|---|---|---|
+  | st-scx1 | standing user-1017 | 64.19 | scx_lavd 64.54 | p95 17.8 -> 17.0 |
+  | st-bpf1 | standing user-1017 | 63.73 | scx_bpfland 64.64 | p95 18.4 -> 17.0, p99 21.1 -> 18.0 |
+  | tr-bpf1 | circling 12x15 s | 47.89 | scx_bpfland 50.10 | >40 ms 10.4 -> 3.7/min, >50 ms 5 -> 0 |
+  | tr-bpf2 | circling 12x15 s | 44.47 | scx_bpfland 45.59 | >40 ms 16.2 -> 6.2/min, >50 ms 6 -> 1 |
+  | tr-lavd1 | circling 12x15 s | 45.19 | scx_lavd --performance 45.86 | >40 ms 8.3 -> 9.2/min |
+  scx_bpfland (defaults) cuts slow frames while traversing by more than half in both sessions;
+  scx_lavd does not.
+- GPU clock offsets in the GPU-bound warehouse fight (GPU 96% busy), live toggle, VSync off:
+  +100 core / +250 NVML memory 59.00 -> 60.91 fps (+3.2%, wh-gpu1); +150 / +500 58.40 -> 61.35
+  (+5.1%, wh-gpu2), no Xid errors. The open world is CPU-bound and does not gain. Offsets are reset
+  after each run; not applied (a hardware choice for the user).
+- Render thread while circling (prof-3, perf 40 s, s17-dev): game code 56%, libnvidia-glcore 14%,
+  d3d12core 12% (index cache lookup 1.4%, descriptor copies ~2.8%, SetPipelineState 0.9%, the
+  rest under 0.5% each), ucrtbase 4.5%, ntdll 3.5%, libc 3.5%. Little left in vkd3d to take.
+- Fight regression check, S16 (s16-frozen) vs S17 (s17-dev), warehouse prompt, VSync off, launches
+  interleaved: S16 56.09 / 57.25 / 55.71 (mean 56.35), S17 55.38 / 55.99 / 57.40 / 55.93 (mean 56.18):
+  -0.3%, inside launch spread (S16 alone spans 1.5 fps). No GPU write into the geometry heap in the
+  fight, so S17's mirroring path never runs there. The fourth S16 launch was cut short by Claude
+  Code's low-memory guard (it also left the bench prefix's VSync at 0; restored by hand).
+- Candidate for play: S17 + scx_bpfland for the game session. Not applied yet (the user asked for
+  the Lutris entry to stay on S16 until everything is settled).
+
+## S17 (2026-10-21): checkpoint-s17, scx_bpfland for play sessions, GPU offsets dropped
+
+- Whole-launch A/B, S16 frozen on the kernel scheduler vs S17 with scx_bpfland from launch to exit
+  (as play runs it), VSync off, swing-1017 circle route, 130 s windows (cb-ow-*; launches whose
+  scheduler did not match the plan are listed by what actually ran, see the race below):
+  S16 stock 43.41 / 44.28 / 50.14 / 46.41 / 48.90 fps (mean 46.6), frames > 40 ms 29.3 / 14.9 / 4.1 /
+  9.5 / 5.4 per min (mean 12.6), > 50 ms 15 / 5 / 2 / 4 / 1; S17 + bpfland 49.06 / 48.57 / 47.87 / 46.61
+  (mean 48.0), 5.9 / 2.3 / 4.0 / 8.7 per min (mean 5.2), > 50 ms 2 / 1 / 3 / 3. Launch spread is wide;
+  the same-game toggles (S17's cache +4.5%, bpfland's halved tails) are the precise measurements and
+  agree. Warehouse fight (cb-wh-*): S16 stock 57.28 / 56.51 / 55.95, S17 stock 57.11, S17 + bpfland
+  57.02 / 57.65: unchanged. The series was cut short by Claude Code's low-memory guard after
+  cb-ow-B16 (the game, bpfland and VSync 0 it left behind were cleaned up by hand).
+- Scheduler race: a scheduler that was just killed takes up to ~1 s to unregister, and scx_bpfland
+  started meanwhile exits with "another sched_ext scheduler is already running" (cb-ow-B3, cb-wh-B9
+  ran without it; cb-wh-A7 started while B6's was unregistering). The runner and tools/miles-session
+  now wait for /sys/kernel/sched_ext/state.
+- Review of fork 038bf927 (index cache mirroring; clean-slate, Opus): mirrored path correct
+  (ordering, transfer-queue fills, allocator-reset lifetime, pins, locking; diagnostics inert when
+  unset). Gaps only in writers that exclude instead of mirroring (already-recorded draws over an
+  excluded range would read stale indices) and in writers neither mirrored nor excluded (CopyTiles
+  to a heap buffer, ExecuteIndirect UAV root arguments, reserved resources mapped onto the heap).
+  This game: 0 exclusions in all 49 S17-era logs (the INFO "no live run overlapped" never appears
+  either), and s17-verify2's byte-for-byte check would catch any untracked writer: 4,291,564
+  compared, 0 differ, 0 submitted late. Shipped as is.
+- GPU offsets +150 core / +500 memory for whole launches: warehouse 59.99 / 59.97 fps (+4.6% over
+  S17 + bpfland at stock clocks), but the open-world launch (oc-ow-1) lost the device 36 s into
+  swinging (VK_ERROR_DEVICE_LOST in vkd3d, no Xid in the kernel log) and Hyprland aborted at the same
+  moment (hyprlandCrashReport993.txt, 07:56:36, CHyprOpenGLImpl::begin assert: its GL context died
+  with the GPU fault). No other session in the captures ever lost the device. Not stable: dropped,
+  tools/miles-session keeps 0 / 0.
+- Checkpoint: fork commit 93e5d388, tag checkpoint-s17, patches/vkd3d-proton 0008-0012 (tools/fork.sh
+  rebuilds it with every hash checked). Binaries build/checkpoint-s17/bin = the build/s17 DLLs every
+  S17 measurement used (SHA256SUMS; d3d12core 6abf96ab..., d3d12 6a9bbc1d...; built from 93e5d388's
+  tree before it was committed, so the build id is c5c06ee3's), read-only learned copy 58ee4aeb...;
+  config bench/configs/s17-frozen.env. Deferred command recording is in the binary but off.
+- Play: bench/play.sh plays S17 and runs tools/miles-session (installed root-owned by
+  tools/install-miles-session.sh with a sudo rule for exactly `miles-session start <pid>` / `stop`):
+  scx_bpfland in a transient unit miles-session.service, stopped by play.sh's exit trap or, if
+  play.sh dies first, by the unit's own watch on its pid. End-to-end check on the bench prefix
+  (play-e2e-s17): S17 DLLs in place and bpfland attached while the game ran; after it exited the
+  kernel scheduler was back, the unit gone, the DLLs removed. Back to S16: PLAY_DLLS=build/checkpoint-s16/bin
+  PLAY_LEVERS=0.
+- Dashboard, README and docs updated for S17 (2026-10-21, later): S17 is in data/steps.csv without
+  fight launches (the fight never copies into the geometry heap), the headline takes the last step
+  with fight launches (still S16), and a new open-world section draws data/s17_launches.csv (every
+  whole launch above, uncapped) and data/s17_levers.csv (the same-session switches). The fight
+  series by the bench's method (build/v24-one.sh) stays undone at the user's call: only v24-A1 ran.
+- Release `checkpoint-s17` (2026-10-21): DLLs built from the committed checkpoint-s17 by README's
+  Building steps (Nix GCC 15.3), d3d12core c48b6f86..., d3d12 5a9cc229... (unchanged since S16). A
+  fresh clone from GitHub and this repository built them byte-identical. The layout matters: meson
+  embeds source paths relative to the build directory (`../../src/vkd3d-proton/...`), so a build
+  outside `<repo>/build/<dir>` differs (a first try in the scratchpad did). Smoke test
+  (rel-s17-smoke, user-1017): build id 56ed43c5e1bc2f5, every feature on, the usual err lines only.
+- The measured S17 binaries (build/checkpoint-s17/bin, from build/s17) are not the same compiler:
+  build/s17 was set up in the Nix shell (GCC 15.3) but later incremental rebuilds ran outside it, and
+  the cross file names the compiler without a path, so they used the system's mingw-w64-gcc 16.2
+  (Arch) and linked its static libgcc / libstdc++ with their debug info (the 20 MB size; .text
+  5,293,648 against the release's 5,224,576 bytes). Same source. The S17 numbers that matter are
+  same-session switches, which the compiler does not touch; the whole-launch S16 vs S17 comparisons
+  also changed the compiler (no fight difference). Play keeps the measured binaries. Rebuild only
+  inside `nix develop`.

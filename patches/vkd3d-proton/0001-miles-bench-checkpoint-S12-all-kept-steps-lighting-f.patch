@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Zaid <nottzaid@tutamail.com>
 Date: Wed, 14 Oct 2026 18:32:07 +0300
-Subject: [PATCH 1/7] miles-bench checkpoint S12: all kept steps, lighting fix,
- instrumentation
+Subject: [PATCH 01/12] miles-bench checkpoint S12: all kept steps, lighting
+ fix, instrumentation
 
 VRAM reserve, geometry decompression fix, index cache (fail-fast), particle
 batching, discard barriers, particle draw constants, lazy descriptor heaps,

@@ -99,7 +99,7 @@ def send(key):
     done = root / "vkd3d-input.done"
     done.unlink(missing_ok=True)
     (root / "vkd3d-input").write_text(key + "\n")
-    wait = 3 + (int(key.split()[1]) / 1000 if key.startswith("hold ") else 0)  # "hold <ms> <keys>"
+    wait = 3 + (int(key.split()[1]) / 1000 if key.startswith(("hold ", "pad ")) else 0)  # "hold|pad <ms> ..."
     for _ in range(int(wait * 10)):
         time.sleep(0.1)
         if done.exists():

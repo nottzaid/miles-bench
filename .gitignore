@@ -18,4 +18,5 @@ tools/ghidra-proj/
 # Logs, vkd3d's pipeline cache, Python bytecode
 *.log
 vkd3d-proton.cache
+vkd3d-proton.cache.write
 __pycache__/

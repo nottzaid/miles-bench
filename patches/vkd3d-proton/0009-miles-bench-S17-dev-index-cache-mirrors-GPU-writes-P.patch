@@ -1,0 +1,869 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zaid <nottzaid@tutamail.com>
+Date: Tue, 20 Oct 2026 03:57:51 +0300
+Subject: [PATCH 09/12] miles-bench S17 dev: index cache mirrors GPU writes;
+ PSO and allocation diagnostics
+
+Index cache: CopyBufferRegion/CopyResource into the geometry heap copy
+the same bytes into every live cached run (in the same command buffer)
+instead of disabling the cache for the session; written pages stay out
+of the cache until the allocator holding the copy is reset. Writers
+that cannot be mirrored (UAVs, SO, clears, queries, WriteBufferImmediate,
+placed footprints) exclude their range for good.
+
+Diagnostics: VKD3D_BENCH_GPL_PROBE (library + fast link timing per PSO),
+pso firstbind (create-to-first-bind gap of slow compiles), and the
+requester of slow vkAllocateMemory calls.
+---
+ libs/vkd3d/command.c       | 101 ++++++++++++++-
+ libs/vkd3d/idxcache.c      | 254 ++++++++++++++++++++++++++++++++++++-
+ libs/vkd3d/memory.c        |  28 +++-
+ libs/vkd3d/resource.c      |  21 +++
+ libs/vkd3d/state.c         |  57 ++++++++-
+ libs/vkd3d/vkd3d_private.h |  17 +++
+ 6 files changed, 460 insertions(+), 18 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 38075fa6..60fe9cf7 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2825,6 +2825,8 @@ static void d3d12_command_allocator_free_resources(struct d3d12_command_allocato
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     unsigned int i;
+ 
++    vkd3d_index_cache_allocator_reset(allocator);
++
+     for (i = 0; i < allocator->buffer_view_count; ++i)
+     {
+         VK_CALL(vkDestroyBufferView(device->vk_device, allocator->buffer_views[i], NULL));
+@@ -2959,6 +2961,8 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
+             d3d12_command_list_allocator_destroyed(allocator->current_command_list);
+ 
+         d3d12_command_allocator_free_resources(allocator);
++        vkd3d_free(allocator->idxc_pins);
++        vkd3d_free(allocator->idxc_writes);
+         vkd3d_free(allocator->buffer_views);
+         vkd3d_free(allocator->views);
+         vkd3d_free(allocator->pipelines);
+@@ -11599,6 +11603,61 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
+     d3d12_command_list_check_compute_barrier(list);
+ }
+ 
++/* miles-bench: a GPU write at a VA that idxcache.c cannot mirror: if it lands in the geometry heap, the range
++ * (size 0: the rest of the resource, as for root UAVs) leaves the index cache for good. */
++static void d3d12_command_list_index_cache_exclude_va(struct d3d12_command_list *list, VkDeviceAddress va,
++        VkDeviceSize size, const char *what)
++{
++    const struct vkd3d_unique_resource *resource;
++
++    if (!va || !vkd3d_index_cache_va_is_source(va))
++        return;
++    if (!(resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, va)))
++    {
++        vkd3d_index_cache_disable(what);
++        return;
++    }
++    if (!size)
++        size = resource->size - (va - resource->va);
++    vkd3d_index_cache_exclude(resource->vk_buffer, va - resource->va, size, what);
++}
++
++/* miles-bench: the index cache keeps VRAM copies of the geometry heap (idxcache.c). After a copy into the
++ * heap was recorded, the same bytes go into every cached run over the range, right behind it, so draws
++ * bound to those runs see what the heap holds. */
++static void d3d12_command_list_index_cache_mirror(struct d3d12_command_list *list, struct d3d12_resource *dst_resource,
++        VkBuffer src_buffer, VkDeviceSize src_offset, VkDeviceSize dst_offset, VkDeviceSize size)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkCopyBufferInfo2 copy_info;
++    VkBufferCopy2 *regions;
++    VkBuffer cache_buffer;
++    size_t count;
++
++    if (!vkd3d_index_cache_is_source(dst_resource->res.vk_buffer))
++        return;
++    if (!list->allocator)
++    {
++        vkd3d_index_cache_disable("a copy into the geometry heap was recorded without an allocator");
++        return;
++    }
++    if ((count = vkd3d_index_cache_gpu_write(list->allocator, src_offset, dst_offset, size, &regions, &cache_buffer)))
++    {
++        /* One span for write-after-write tracking: the regions are ascending and disjoint, and a barrier
++         * injected between them would leave the earlier ones of this same copy untracked. */
++        d3d12_command_list_mark_copy_buffer_write(list, cache_buffer, regions[0].dstOffset,
++                regions[count - 1].dstOffset + regions[count - 1].size - regions[0].dstOffset, false);
++        copy_info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
++        copy_info.pNext = NULL;
++        copy_info.srcBuffer = src_buffer;
++        copy_info.dstBuffer = cache_buffer;
++        copy_info.regionCount = count;
++        copy_info.pRegions = regions;
++        VK_CALL(vkCmdCopyBuffer2(list->cmd.vk_command_buffer, &copy_info));
++    }
++    vkd3d_free(regions);
++}
++
+ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_list_iface *iface,
+         ID3D12Resource *dst, UINT64 dst_offset, ID3D12Resource *src, UINT64 src_offset, UINT64 byte_count)
+ {
+@@ -11636,10 +11695,6 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
+     }
+     vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_COPY_DST, dst_resource->res.va + dst_offset, byte_count);
+ 
+-    /* idxcache.c only follows CPU writes into the geometry heap. */
+-    if (vkd3d_index_cache_is_source(dst_resource->res.vk_buffer))
+-        vkd3d_index_cache_disable("CopyBufferRegion writes the geometry heap");
+-
+     d3d12_command_list_track_resource_usage(list, dst_resource, true);
+     d3d12_command_list_track_resource_usage(list, src_resource, true);
+ 
+@@ -11673,6 +11728,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
+             !!(dst_resource->flags & VKD3D_RESOURCE_RESERVED));
+     VK_CALL(vkCmdCopyBuffer2(list->cmd.vk_command_buffer, &copy_info));
+ 
++    d3d12_command_list_index_cache_mirror(list, dst_resource, copy_info.srcBuffer, buffer_copy.srcOffset,
++            buffer_copy.dstOffset, byte_count);
++
+     VKD3D_BREADCRUMB_COMMAND(COPY);
+ }
+ 
+@@ -12983,6 +13041,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
+     TRACE("iface %p, dst %p, dst_x %u, dst_y %u, dst_z %u, src %p, src_box %p.\n",
+             iface, dst, dst_x, dst_y, dst_z, src, src_box);
+ 
++    if (dst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
++        vkd3d_index_cache_exclude(impl_from_ID3D12Resource(dst->pResource)->res.vk_buffer,
++                impl_from_ID3D12Resource(dst->pResource)->mem.offset + dst->PlacedFootprint.Offset,
++                (VkDeviceSize)dst->PlacedFootprint.Footprint.RowPitch * dst->PlacedFootprint.Footprint.Height *
++                dst->PlacedFootprint.Footprint.Depth, "CopyTextureRegion writes the geometry heap");
++
+     d3d12_command_list_check_render_pass_validation(list, "CopyTextureRegion called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+ 
+@@ -13191,6 +13255,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
+         d3d12_command_list_mark_copy_buffer_write(list, copy_info.dstBuffer, vk_buffer_copy.dstOffset, vk_buffer_copy.size,
+                 !!(dst_resource->flags & VKD3D_RESOURCE_RESERVED));
+         VK_CALL(vkCmdCopyBuffer2(list->cmd.vk_command_buffer, &copy_info));
++        d3d12_command_list_index_cache_mirror(list, dst_resource, copy_info.srcBuffer, vk_buffer_copy.srcOffset,
++                vk_buffer_copy.dstOffset, vk_buffer_copy.size);
+     }
+     else
+     {
+@@ -14791,6 +14857,14 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetPipelineState(d3d12_command_
+ 
+     TRACE("iface %p, pipeline_state %p.\n", iface, pipeline_state);
+ 
++    /* miles-bench: how long after a slow compile the game first records with the PSO. */
++    if (state && state->bench_compile_us >= 10000 && !state->bench_bound &&
++            !InterlockedExchange(&state->bench_bound, 1))
++        vkd3d_frametrace_event("pso firstbind %.1f ms after create, compile %.1f ms, pso %016"PRIx64" tid %04x",
++                (vkd3d_get_current_time_ns() - state->bench_created_ns) / 1e6, state->bench_compile_us / 1e3,
++                vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat),
++                (unsigned int)GetCurrentThreadId());
++
+     if ((TRACE_ON() || list->device->debug_ring.active) && state)
+     {
+         if (d3d12_pipeline_state_has_replaced_shaders(state))
+@@ -16726,6 +16800,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetComputeRootUnorderedAccessVi
+     TRACE("iface %p, root_parameter_index %u, address %#"PRIx64".\n",
+             iface, root_parameter_index, address);
+ 
++    d3d12_command_list_index_cache_exclude_va(list, address, 0, "a root UAV points into the geometry heap");
++
+     d3d12_command_list_set_root_descriptor(list, &list->compute_bindings,
+             root_parameter_index, address);
+ }
+@@ -16738,6 +16814,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetGraphicsRootUnorderedAccessV
+     TRACE("iface %p, root_parameter_index %u, address %#"PRIx64".\n",
+             iface, root_parameter_index, address);
+ 
++    d3d12_command_list_index_cache_exclude_va(list, address, 0, "a root UAV points into the geometry heap");
++
+     d3d12_command_list_set_root_descriptor(list, &list->graphics_bindings,
+             root_parameter_index, address);
+ }
+@@ -16928,6 +17006,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_SOSetTargets(d3d12_command_list
+     {
+         if (views[i].BufferLocation && views[i].SizeInBytes)
+         {
++            d3d12_command_list_index_cache_exclude_va(list, views[i].BufferLocation, views[i].SizeInBytes,
++                    "a stream output target is in the geometry heap");
++            d3d12_command_list_index_cache_exclude_va(list, views[i].BufferFilledSizeLocation, 4,
++                    "a stream output counter is in the geometry heap");
+             resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, views[i].BufferLocation);
+             if (resource)
+             {
+@@ -18303,6 +18385,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewUint(d3
+ 
+     metadata = d3d12_desc_decode_metadata(list->device, cpu_handle.ptr);
+     resource_impl = impl_from_ID3D12Resource(resource);
++    if (resource_impl && d3d12_resource_is_buffer(resource_impl))
++        vkd3d_index_cache_exclude(resource_impl->res.vk_buffer, resource_impl->mem.offset, resource_impl->desc.Width,
++                "a UAV clear writes the geometry heap");
+ 
+     if (!resource_impl || !metadata.view)
+         return;
+@@ -18463,6 +18548,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewFloat(d
+ 
+     metadata = d3d12_desc_decode_metadata(list->device, cpu_handle.ptr);
+     resource_impl = impl_from_ID3D12Resource(resource);
++    if (resource_impl && d3d12_resource_is_buffer(resource_impl))
++        vkd3d_index_cache_exclude(resource_impl->res.vk_buffer, resource_impl->mem.offset, resource_impl->desc.Width,
++                "a UAV clear writes the geometry heap");
+ 
+     if (!resource_impl || !metadata.view)
+         return;
+@@ -19092,6 +19180,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResolveQueryData(d3d12_command_
+     if (!query_count)
+         return;
+ 
++    if (d3d12_resource_is_buffer(buffer))
++        vkd3d_index_cache_exclude(buffer->res.vk_buffer, buffer->mem.offset + aligned_dst_buffer_offset,
++                (VkDeviceSize)query_count * d3d12_query_heap_type_get_data_size(query_heap->desc.Type),
++                "ResolveQueryData writes the geometry heap");
+     if (!d3d12_resource_is_buffer(buffer))
+     {
+         WARN("Destination resource is not a buffer.\n");
+@@ -21518,6 +21610,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_WriteBufferImmediate(d3d12_comm
+ 
+     for (i = 0; i < count; ++i)
+     {
++        d3d12_command_list_index_cache_exclude_va(list, parameters[i].Dest, 4, "WriteBufferImmediate writes the geometry heap");
+         if (!(resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, parameters[i].Dest)))
+         {
+             d3d12_command_list_mark_as_invalid(list, "Invalid target address %p.\n", parameters[i].Dest);
+diff --git a/libs/vkd3d/idxcache.c b/libs/vkd3d/idxcache.c
+index 147afb0e..df4aceda 100644
+--- a/libs/vkd3d/idxcache.c
++++ b/libs/vkd3d/idxcache.c
+@@ -22,8 +22,17 @@
+  * (enginepatch.c hooks every writer and reports each written range after the write, plus every new
+  * allocation). Each write stamps its source pages with a new generation; a cached run carries the
+  * generation it was copied at and serves a draw only if none of the draw's pages were written
+- * since. A GPU write into the heap (never seen: the ManagedBuffer is filled by CPU stores) turns the
+- * cache off for good.
++ * since.
++ *
++ * GPU writes into the heap (CopyBufferRegion; in the open world, a few minutes in): draws already
++ * recorded against a cached run may run after the copy (a list recorded earlier, submitted later), so
++ * every live run over the written range gets the same bytes copied into it right after the app's copy,
++ * in the same command buffer: the cached copy changes at the same point of GPU order as the heap,
++ * under the app's own barriers (buffer barriers are global memory barriers here). The written pages
++ * then stay out of the cache until the GPU is done with the copy, which D3D12 guarantees once the
++ * allocator holding it is reset (or destroyed): a run created earlier would be filled on the transfer
++ * queue, which does not wait for the app's copy. Meanwhile draws over them bind the heap itself, as stock
++ * does. The mirrored runs stay pinned until then too.
+  */
+ 
+ #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
+@@ -37,6 +46,7 @@ static unsigned int idxc_page_shift = 12;
+ static VkDeviceSize idxc_size = 64ull << 20;
+ #define IDXC_MIN_SOURCE (256ull << 20)
+ #define IDXC_REUSE_FRAMES 8
++#define IDXC_EXCLUDED 0x80000000u
+ 
+ struct idxc_entry
+ {
+@@ -76,14 +86,20 @@ static struct
+     uint64_t *run_last;
+     struct idxc_entry *table;
+     uint32_t *page_gen;  /* per source page: generation of the last write */
++    uint32_t *page_gpu;  /* per source page: GPU writes recorded and not known to be done (allocator not reset),
++                          * plus IDXC_EXCLUDED once a write the cache cannot follow may reach it */
++    uint32_t epoch;      /* source heap registrations, so page ranges of an earlier heap are never released */
++    uint64_t gpu_writes, gpu_pages, gpu_mirrored, gpu_bypassed;
+     uint32_t *run_gen;   /* per cache page, at a run's first page: generation it was copied at */
+     uint32_t gen;
+     const uint8_t *src_cpu;
++    VkDeviceAddress src_va;
+     bool disabled;
+     struct idxc_copy *pending;
+     size_t pending_count, pending_size;
+     uint64_t hits, misses, full, bytes, stale, invalidations, verified, mismatched;
+     uint64_t *run_copied; /* per cache page, at a run's first page: present count of the copy */
++    uint32_t *run_pins;   /* per cache page, at a run's first page: allocators holding a mirror into it */
+     uint64_t submit_checks;
+     /* The present count of the last failed allocation and the smallest run size that failed in it:
+      * within one present nothing becomes evictable (run_last only grows), so any run at least that
+@@ -188,7 +204,8 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
+                 !(idxc.run_owner = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_owner))) ||
+                 !(idxc.run_last = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_last))) ||
+                 !(idxc.run_gen = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_gen))) ||
+-                !(idxc.run_copied = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_copied))))
++                !(idxc.run_copied = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_copied))) ||
++                !(idxc.run_pins = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_pins))))
+         {
+             rwlock_unlock_write(&idxc_lock);
+             return;
+@@ -199,7 +216,8 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
+ 
+     src_pages = (size_t)((heap->desc.SizeInBytes + (1u << idxc_page_shift) - 1) >> idxc_page_shift);
+     if (!(idxc.table = vkd3d_calloc(src_pages, sizeof(*idxc.table))) ||
+-            !(idxc.page_gen = vkd3d_calloc(src_pages, sizeof(*idxc.page_gen))))
++            !(idxc.page_gen = vkd3d_calloc(src_pages, sizeof(*idxc.page_gen))) ||
++            !(idxc.page_gpu = vkd3d_calloc(src_pages, sizeof(*idxc.page_gpu))))
+     {
+         rwlock_unlock_write(&idxc_lock);
+         return;
+@@ -209,6 +227,9 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
+     idxc.src_offset = heap->allocation.offset;
+     idxc.src_size = heap->desc.SizeInBytes;
+     idxc.src_cpu = heap->allocation.cpu_address;
++    idxc.src_va = heap->allocation.resource.va;
++    idxc.epoch++;
++    idxc.gpu_pages = 0;
+     idxc.gen = 1;
+     idxc.cache_head = 0;
+     rwlock_unlock_write(&idxc_lock);
+@@ -227,7 +248,10 @@ void vkd3d_index_cache_unregister(struct d3d12_heap *heap)
+         idxc.table = NULL;
+         vkd3d_free(idxc.page_gen);
+         idxc.page_gen = NULL;
++        vkd3d_free(idxc.page_gpu);
++        idxc.page_gpu = NULL;
+         idxc.src_cpu = NULL;
++        idxc.src_va = 0;
+         idxc.heap = NULL;
+         idxc.src_buffer = VK_NULL_HANDLE;
+         idxc.pending_count = 0;
+@@ -240,6 +264,66 @@ bool vkd3d_index_cache_is_source(VkBuffer buffer)
+     return buffer && buffer == idxc.src_buffer;
+ }
+ 
++bool vkd3d_index_cache_va_is_source(VkDeviceAddress va)
++{
++    return idxc.src_va && va >= idxc.src_va && va - idxc.src_va < idxc.src_size;
++}
++
++/* [offset, offset + size) of `buffer` may be written by the GPU in a way the cache cannot mirror (a UAV over it,
++ * a clear, a query resolve): if it is the source, those pages leave the cache for good. Draws already
++ * recorded against runs over them are not covered, so the log says how many live runs overlap (0: none). */
++void vkd3d_index_cache_exclude(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const char *what)
++{
++    uint32_t first, last, i, end, g, overlap = 0, newly = 0;
++    VkDeviceSize rel, run_lo;
++
++    if (!size || !vkd3d_index_cache_is_source(buffer))
++        return;
++    rwlock_lock_write(&idxc_lock);
++    if (!idxc.page_gpu || offset < idxc.src_offset || offset - idxc.src_offset >= idxc.src_size)
++    {
++        rwlock_unlock_write(&idxc_lock);
++        return;
++    }
++    rel = offset - idxc.src_offset;
++    size = min(size, idxc.src_size - rel);
++    first = (uint32_t)(rel >> idxc_page_shift);
++    last = (uint32_t)((rel + size - 1) >> idxc_page_shift);
++    for (i = first; i <= last; i++)
++        newly += !(idxc.page_gpu[i] & IDXC_EXCLUDED);
++    if (!newly)
++    {
++        rwlock_unlock_write(&idxc_lock);
++        return;
++    }
++    for (i = 0; i < idxc.cache_pages; i = end)
++    {
++        end = i + 1;
++        if (idxc.run_of[i] != (int32_t)i)
++            continue;
++        while (end < idxc.cache_pages && idxc.run_of[end] == (int32_t)i)
++            end++;
++        run_lo = (VkDeviceSize)idxc.run_owner[i] << idxc_page_shift;
++        if (run_lo < rel + size && run_lo + ((VkDeviceSize)(end - i) << idxc_page_shift) > rel)
++            overlap++;
++    }
++    g = ++idxc.gen;
++    for (i = first; i <= last; i++)
++    {
++        idxc.page_gen[i] = g;
++        if (!idxc.page_gpu[i])
++            idxc.gpu_pages++;
++        idxc.page_gpu[i] |= IDXC_EXCLUDED;
++    }
++    rwlock_unlock_write(&idxc_lock);
++    if (overlap)
++        ERR("idxcache: %s: %"PRIu64" bytes at heap offset %#"PRIx64" leave the cache (%u live runs overlapped).\n",
++                what, (uint64_t)size, (uint64_t)rel, overlap);
++    else
++        INFO("idxcache: %s: %"PRIu64" bytes at heap offset %#"PRIx64" leave the cache (no live run overlapped).\n",
++                what, (uint64_t)size, (uint64_t)rel);
++}
++
+ /* The CPU finished writing [address, address + size) (enginepatch.c, after each geometry write). */
+ void vkd3d_index_cache_invalidate_cpu(const void *address, uint64_t size)
+ {
+@@ -273,6 +357,135 @@ void vkd3d_index_cache_disable(const char *why)
+     }
+ }
+ 
++/* The GPU writes [offset, offset + size) of the source buffer: a CopyBufferRegion just recorded into a
++ * command buffer of `allocator`, from src_offset of its source buffer. Returns the regions to copy right
++ * after it from the same source buffer into *cache_buffer: one per live run over the written range.
++ * Those runs stay pinned (never evicted) until the allocator is reset or destroyed: the mirror lands
++ * whenever the list runs, which D3D12 only bounds by the allocator's reset. The caller frees *regions. */
++size_t vkd3d_index_cache_gpu_write(struct d3d12_command_allocator *allocator, VkDeviceSize src_offset,
++        VkDeviceSize offset, VkDeviceSize size, VkBufferCopy2 **regions, VkBuffer *cache_buffer)
++{
++    VkDeviceSize rel, run_lo, run_hi, lo, hi;
++    uint32_t first, last, i, end, g;
++    size_t count = 0, capacity = 0;
++    VkBufferCopy2 *r;
++
++    *regions = NULL;
++    *cache_buffer = VK_NULL_HANDLE;
++    if (!size)
++        return 0;
++    rwlock_lock_write(&idxc_lock);
++    /* Mirrors go on after the cache was turned off: draws recorded before still bind its runs. */
++    if (!idxc.page_gpu || offset < idxc.src_offset || offset - idxc.src_offset >= idxc.src_size)
++    {
++        rwlock_unlock_write(&idxc_lock);
++        return 0;
++    }
++    rel = offset - idxc.src_offset;
++    size = min(size, idxc.src_size - rel);
++    first = (uint32_t)(rel >> idxc_page_shift);
++    last = (uint32_t)((rel + size - 1) >> idxc_page_shift);
++
++    /* Every run over the range, drawn recently or not: a list recorded long ago may still be submitted
++     * (run_last is only a hint for eviction). Runs replaced in the table count too: recorded draws may
++     * still bind them. */
++    for (i = 0; i < idxc.cache_pages; i = end)
++    {
++        end = i + 1;
++        if (idxc.run_of[i] != (int32_t)i)
++            continue;
++        while (end < idxc.cache_pages && idxc.run_of[end] == (int32_t)i)
++            end++;
++        run_lo = (VkDeviceSize)idxc.run_owner[i] << idxc_page_shift;
++        run_hi = min(run_lo + ((VkDeviceSize)(end - i) << idxc_page_shift), idxc.src_size);
++        lo = max(run_lo, rel);
++        hi = min(run_hi, rel + size);
++        if (lo >= hi)
++            continue;
++        if (!vkd3d_array_reserve((void **)regions, &capacity, count + 1, sizeof(**regions)) ||
++                !vkd3d_array_reserve((void **)&allocator->idxc_pins, &allocator->idxc_pins_size,
++                allocator->idxc_pin_count + 1, sizeof(*allocator->idxc_pins)))
++        {
++            /* Draws already recorded against this run would read stale bytes; nothing to do but stop. */
++            idxc.disabled = true;
++            rwlock_unlock_write(&idxc_lock);
++            ERR("idxcache: out of memory mirroring a GPU write, turning the index cache off.\n");
++            *cache_buffer = idxc.cache.resource.vk_buffer;
++            return count;
++        }
++        r = &(*regions)[count++];
++        memset(r, 0, sizeof(*r));
++        r->sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
++        r->srcOffset = src_offset + (lo - rel);
++        r->dstOffset = idxc.cache.offset + ((VkDeviceSize)i << idxc_page_shift) + (lo - run_lo);
++        r->size = hi - lo;
++        idxc.run_pins[i]++;
++        allocator->idxc_pins[allocator->idxc_pin_count++] = i;
++    }
++    g = ++idxc.gen;
++    for (i = first; i <= last; i++)
++    {
++        idxc.page_gen[i] = g;
++        if (!idxc.page_gpu[i]++)
++            idxc.gpu_pages++;
++    }
++    if (vkd3d_array_reserve((void **)&allocator->idxc_writes, &allocator->idxc_writes_size,
++            allocator->idxc_write_count + 1, sizeof(*allocator->idxc_writes)))
++    {
++        allocator->idxc_writes[allocator->idxc_write_count].epoch = idxc.epoch;
++        allocator->idxc_writes[allocator->idxc_write_count].first = first;
++        allocator->idxc_writes[allocator->idxc_write_count++].last = last;
++    }
++    else
++    {
++        /* Never released: the pages stay out of the cache. */
++        ERR("idxcache: out of memory recording a GPU write; its pages stay out of the cache.\n");
++    }
++    idxc.gpu_mirrored += count;
++    if (idxc.gpu_writes++ < 16 || !(idxc.gpu_writes & (idxc.gpu_writes - 1)))
++        INFO("idxcache: GPU write of %"PRIu64" bytes at heap offset %#"PRIx64" (%zu runs mirrored); %"PRIu64
++                " GPU writes, %"PRIu64" runs mirrored, %"PRIu64" pages pending, %"PRIu64" draws bypassed "
++                "so far.\n", (uint64_t)size, (uint64_t)rel, count, idxc.gpu_writes, idxc.gpu_mirrored, idxc.gpu_pages,
++                __atomic_load_n(&idxc.gpu_bypassed, __ATOMIC_RELAXED));
++    *cache_buffer = idxc.cache.resource.vk_buffer;
++    rwlock_unlock_write(&idxc_lock);
++    vkd3d_frametrace_event("idxcache gpu write %"PRIu64" bytes at %#"PRIx64" %zu mirrored", (uint64_t)size,
++            (uint64_t)rel, count);
++    return count;
++}
++
++/* The allocator was reset or destroyed: the GPU is done with its lists, the app's copies and their mirrors
++ * included. The pages they wrote can be cached again, from what the heap now holds. */
++void vkd3d_index_cache_allocator_reset(struct d3d12_command_allocator *allocator)
++{
++    uint32_t i, g = 0;
++    size_t j;
++
++    if (!allocator->idxc_pin_count && !allocator->idxc_write_count)
++        return;
++    rwlock_lock_write(&idxc_lock);
++    for (j = 0; j < allocator->idxc_pin_count; j++)
++        idxc.run_pins[allocator->idxc_pins[j]]--;
++    if (allocator->idxc_write_count)
++        g = ++idxc.gen;
++    for (j = 0; j < allocator->idxc_write_count; j++)
++    {
++        if (!idxc.page_gpu || allocator->idxc_writes[j].epoch != idxc.epoch)
++            continue;
++        for (i = allocator->idxc_writes[j].first; i <= allocator->idxc_writes[j].last; i++)
++        {
++            if (!--idxc.page_gpu[i])
++            {
++                idxc.gpu_pages--;
++                idxc.page_gen[i] = g;
++            }
++        }
++    }
++    rwlock_unlock_write(&idxc_lock);
++    allocator->idxc_pin_count = 0;
++    allocator->idxc_write_count = 0;
++}
++
+ /* Find `pages` contiguous cache pages for a new run, evicting runs not drawn recently. Returns the
+  * first page, or -1 when everything in reach is still in use.
+  *
+@@ -307,7 +520,7 @@ static int32_t idxc_alloc_locked(uint32_t pages)
+         /* A recently drawn run in the way: step past it and keep looking. */
+         for (i = head; i < head + pages; i++)
+         {
+-            if ((run = idxc.run_of[i]) >= 0 && idxc.run_last[run] + IDXC_REUSE_FRAMES > frame)
++            if ((run = idxc.run_of[i]) >= 0 && (idxc.run_last[run] + IDXC_REUSE_FRAMES > frame || idxc.run_pins[run]))
+                 break;
+         }
+         if (i < head + pages)
+@@ -346,7 +559,7 @@ static int32_t idxc_alloc_locked(uint32_t pages)
+         for (i = 0; i < idxc.cache_pages; i++)
+         {
+             run = idxc.run_of[i];
+-            if (run >= 0 && idxc.run_last[run] + IDXC_REUSE_FRAMES > frame)
++            if (run >= 0 && (idxc.run_last[run] + IDXC_REUSE_FRAMES > frame || idxc.run_pins[run]))
+                 gap = 0;
+             else if (++gap > best)
+                 best = gap;
+@@ -390,6 +603,19 @@ bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize
+             rel = offset - idxc.src_offset;
+             p0 = rel >> idxc_page_shift;
+             pages = ((rel + size - 1) >> idxc_page_shift) - p0 + 1;
++            /* Pages the GPU wrote: bind the heap itself, without the exclusive lock. */
++            if (idxc.gpu_pages)
++            {
++                for (i = 0; i < pages; i++)
++                {
++                    if (idxc.page_gpu[p0 + i])
++                    {
++                        __atomic_add_fetch(&idxc.gpu_bypassed, 1, __ATOMIC_RELAXED);
++                        rwlock_unlock_read(&idxc_lock);
++                        return false;
++                    }
++                }
++            }
+             e = &idxc.table[p0];
+             if ((slot = e->slot) && e->pages >= pages)
+             {
+@@ -439,6 +665,22 @@ bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize
+     pages = ((end - 1) >> idxc_page_shift) - p0 + 1;
+     e = &idxc.table[p0];
+ 
++    /* Pages the GPU wrote: the draw binds the heap itself. */
++    if (idxc.gpu_pages)
++    {
++        uint32_t i;
++
++        for (i = 0; i < pages; i++)
++        {
++            if (idxc.page_gpu[p0 + i])
++            {
++                __atomic_add_fetch(&idxc.gpu_bypassed, 1, __ATOMIC_RELAXED);
++                rwlock_unlock_write(&idxc_lock);
++                return false;
++            }
++        }
++    }
++
+     if (e->slot && e->pages >= pages)
+     {
+         uint32_t i, g = idxc.run_gen[e->slot - 1];
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index 83960ba3..ab5f7088 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -1025,6 +1025,9 @@ static bool vkd3d_bench_vram_reserve_refuses(struct d3d12_device *device, uint32
+     return true;
+ }
+ 
++/* miles-bench: what the allocation on this thread is for, for the slow-allocation trace event. */
++static __thread const struct vkd3d_allocate_memory_info *vkd3d_bench_alloc_info;
++
+ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
+         VkDeviceSize size, VkMemoryPropertyFlags type_flags, const uint32_t base_type_mask,
+         void *pNext, bool respect_budget, VkDeviceSize vram_reserve, struct vkd3d_device_memory_allocation *allocation)
+@@ -1164,8 +1167,14 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
+     alloc_ns = vkd3d_get_current_time_ns() - alloc_t0;
+     /* miles-bench: slow or failed driver allocations, on the frame trace's clock. */
+     if (vr != VK_SUCCESS || alloc_ns > 2000000)
+-        vkd3d_frametrace_event("vkAllocateMemory %s %.3f ms %"PRIu64" KiB type %u flags %#x", vr == VK_SUCCESS ? "ok" : "fail",
+-                alloc_ns / 1e6, (uint64_t)allocate_info.allocationSize >> 10, allocate_info.memoryTypeIndex, type_flags);
++        vkd3d_frametrace_event("vkAllocateMemory %s %.3f ms %"PRIu64" KiB type %u flags %#x for %s heap %u hflags %#x aflags %#x",
++                vr == VK_SUCCESS ? "ok" : "fail", alloc_ns / 1e6, (uint64_t)allocate_info.allocationSize >> 10,
++                allocate_info.memoryTypeIndex, type_flags,
++                !vkd3d_bench_alloc_info ? "internal" : (vkd3d_bench_alloc_info->flags & VKD3D_ALLOCATION_FLAG_DEDICATED) ?
++                        "dedicated" : vkd3d_bench_alloc_info->pNext ? "pnext" : "plain",
++                vkd3d_bench_alloc_info ? vkd3d_bench_alloc_info->heap_properties.Type : 0,
++                vkd3d_bench_alloc_info ? vkd3d_bench_alloc_info->heap_flags : 0,
++                vkd3d_bench_alloc_info ? vkd3d_bench_alloc_info->flags : 0);
+     vkd3d_memtrace_vk_allocate(device, allocate_info.memoryTypeIndex, allocate_info.allocationSize,
+             vr == VK_SUCCESS, respect_budget, vr == VK_SUCCESS ? allocation->vk_memory : VK_NULL_HANDLE);
+ 
+@@ -1510,8 +1519,23 @@ static bool vkd3d_is_imported_allocation(const struct vkd3d_allocate_memory_info
+     return false;
+ }
+ 
++static HRESULT vkd3d_memory_allocation_init_impl(struct vkd3d_memory_allocation *allocation, struct d3d12_device *device,
++        struct vkd3d_memory_allocator *allocator, const struct vkd3d_allocate_memory_info *info);
++
+ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allocation, struct d3d12_device *device,
+         struct vkd3d_memory_allocator *allocator, const struct vkd3d_allocate_memory_info *info)
++{
++    const struct vkd3d_allocate_memory_info *outer = vkd3d_bench_alloc_info;
++    HRESULT hr;
++
++    vkd3d_bench_alloc_info = info;
++    hr = vkd3d_memory_allocation_init_impl(allocation, device, allocator, info);
++    vkd3d_bench_alloc_info = outer;
++    return hr;
++}
++
++static HRESULT vkd3d_memory_allocation_init_impl(struct vkd3d_memory_allocation *allocation, struct d3d12_device *device,
++        struct vkd3d_memory_allocator *allocator, const struct vkd3d_allocate_memory_info *info)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     VkMemoryPriorityAllocateInfoEXT priority_info;
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index bf8b762f..4181c2a4 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -8276,6 +8276,13 @@ void d3d12_desc_create_uav_heap(vkd3d_cpu_descriptor_va_t desc_va, struct d3d12_
+     if (counter_resource && (!resource || !is_buffer))
+         FIXME("Ignoring counter resource %p.\n", counter_resource);
+ 
++    /* miles-bench: a UAV can write the geometry heap; its range leaves the index cache for good. */
++    if (is_buffer && resource)
++        vkd3d_index_cache_exclude(resource->res.vk_buffer, resource->mem.offset, resource->desc.Width,
++                "a UAV views the geometry heap");
++    if (counter_resource && d3d12_resource_is_buffer(counter_resource))
++        vkd3d_index_cache_exclude(counter_resource->res.vk_buffer, counter_resource->mem.offset,
++                counter_resource->desc.Width, "a UAV counter is in the geometry heap");
+     if (is_buffer)
+         vkd3d_create_buffer_uav_heap(desc_va, device, resource, counter_resource, desc);
+     else
+@@ -8306,6 +8313,13 @@ void d3d12_desc_create_uav_embedded(vkd3d_cpu_descriptor_va_t desc_va, struct d3
+     if (counter_resource && (!resource || !is_buffer))
+         FIXME("Ignoring counter resource %p.\n", counter_resource);
+ 
++    /* miles-bench: a UAV can write the geometry heap; its range leaves the index cache for good. */
++    if (is_buffer && resource)
++        vkd3d_index_cache_exclude(resource->res.vk_buffer, resource->mem.offset, resource->desc.Width,
++                "a UAV views the geometry heap");
++    if (counter_resource && d3d12_resource_is_buffer(counter_resource))
++        vkd3d_index_cache_exclude(counter_resource->res.vk_buffer, counter_resource->mem.offset,
++                counter_resource->desc.Width, "a UAV counter is in the geometry heap");
+     if (is_buffer)
+         vkd3d_create_buffer_uav_embedded(desc_va, device, resource, counter_resource, desc);
+     else
+@@ -8336,6 +8350,13 @@ void d3d12_desc_create_uav(vkd3d_cpu_descriptor_va_t desc_va, struct d3d12_devic
+     if (counter_resource && (!resource || !is_buffer))
+         FIXME("Ignoring counter resource %p.\n", counter_resource);
+ 
++    /* miles-bench: a UAV can write the geometry heap; its range leaves the index cache for good. */
++    if (is_buffer && resource)
++        vkd3d_index_cache_exclude(resource->res.vk_buffer, resource->mem.offset, resource->desc.Width,
++                "a UAV views the geometry heap");
++    if (counter_resource && d3d12_resource_is_buffer(counter_resource))
++        vkd3d_index_cache_exclude(counter_resource->res.vk_buffer, counter_resource->mem.offset,
++                counter_resource->desc.Width, "a UAV counter is in the geometry heap");
+     if (is_buffer)
+         vkd3d_create_buffer_uav(desc_va, device, resource, counter_resource, desc);
+     else
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index af82e9df..e0dab351 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3538,11 +3538,23 @@ static void vkd3d_report_pipeline_creation_feedback_results(const VkPipelineCrea
+ 
+ /* miles-bench: pipeline compiles that take a while, on the frame trace's clock (which thread, how
+  * long, which PSO), to tell shader-compile stalls from everything else. */
++static bool vkd3d_bench_gpl_probe(void)
++{
++    static int probe = -1;
++    char value[8];
++
++    if (probe < 0)
++        probe = vkd3d_get_env_var("VKD3D_BENCH_GPL_PROBE", value, sizeof(value)) && *value == '1';
++    return probe;
++}
++
+ static void vkd3d_bench_pso_event(const char *kind, uint64_t t0, struct d3d12_pipeline_state *state, VkResult vr)
+ {
+     uint64_t ns = vkd3d_get_current_time_ns() - t0;
+ 
+-    if (ns >= 2000000)
++    /* VKD3D_BENCH_GPL_PROBE logs every graphics compile, so library + link can be set against the
++     * monolithic compile of the same PSO. */
++    if (ns >= 2000000 || (vkd3d_bench_gpl_probe() && !strncmp(kind, "graphics", 8)))
+         vkd3d_frametrace_event("pso %s %.3f ms vr %d pso %016"PRIx64" tid %04x", kind, ns / 1e6, vr,
+                 vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), (unsigned int)GetCurrentThreadId());
+ }
+@@ -3647,6 +3659,8 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+     vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
+             vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
+     vkd3d_bench_pso_event("compute", pso_t0, state, vr);
++    state->bench_created_ns = vkd3d_get_current_time_ns();
++    state->bench_compile_us = (state->bench_created_ns - pso_t0) / 1000;
+ 
+     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
+     {
+@@ -6177,6 +6191,10 @@ static HRESULT d3d12_pipeline_state_init_graphics_spirv(struct d3d12_pipeline_st
+     return d3d12_pipeline_state_graphics_handle_meta(state, device);
+ }
+ 
++static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline_state *state,
++        const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
++        uint32_t dynamic_state_flags, bool lto, VkPipeline *vk_pipeline);
++
+ static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_state *state,
+         const struct d3d12_pipeline_state_desc *desc)
+ {
+@@ -6243,11 +6261,33 @@ static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_s
+     graphics->library_flags = 0;
+     graphics->library_create_flags = 0;
+ 
++    /* VKD3D_BENCH_GPL_PROBE: build every plain PSO as a shader library (pre-rasterization + fragment
++     * shader), time a fast link of it (thrown away), then link the pipeline that is used with LTO as
++     * usual. Measurement only: what a never-seen PSO would cost on the creating thread with GPL. */
++    if (vkd3d_bench_gpl_probe() && has_gpl && !create_library && can_compile_pipeline_early &&
++            !(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) &&
++            !(graphics->stage_flags & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT))
++    {
++        library_flags = VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
++                VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
++        create_library = true;
++    }
++
+     if (create_library && has_gpl)
+     {
+         if (!(graphics->library = d3d12_pipeline_state_create_pipeline_variant(state, NULL, graphics->dsv_format,
+                 state->vk_pso_cache, library_flags, &graphics->pipeline_dynamic_states)))
+             return E_OUTOFMEMORY;
++
++        if (vkd3d_bench_gpl_probe() && can_compile_pipeline_early)
++        {
++            const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
++            VkPipeline fast = VK_NULL_HANDLE;
++
++            if (d3d12_pipeline_state_link_pipeline_variant(state, NULL, graphics->dsv_format, state->vk_pso_cache,
++                    graphics->pipeline_dynamic_states, false, &fast) == VK_SUCCESS)
++                VK_CALL(vkDestroyPipeline(state->device->vk_device, fast, NULL));
++        }
+     }
+ 
+     if (can_compile_pipeline_early)
+@@ -6781,7 +6821,7 @@ static void d3d12_pipeline_state_log_graphics_state(const struct d3d12_pipeline_
+ 
+ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline_state *state,
+         const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
+-        uint32_t dynamic_state_flags, VkPipeline *vk_pipeline)
++        uint32_t dynamic_state_flags, bool lto, VkPipeline *vk_pipeline)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
+     struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+@@ -6834,7 +6874,7 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
+     /* Only use LINK_TIME_OPTIMIZATION for the primary pipeline for now,
+      * accept a small runtime perf hit on subsequent compiles in order
+      * to avoid stutter. */
+-    if (!key)
++    if (lto)
+         flags2.flags |= VK_PIPELINE_CREATE_2_LINK_TIME_OPTIMIZATION_BIT_EXT;
+ 
+     cookie = vkd3d_queue_timeline_trace_register_pso_compile(&state->device->queue_timeline_trace);
+@@ -6850,7 +6890,7 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
+     pso_t0 = vkd3d_get_current_time_ns();
+     vr = VK_CALL(vkCreateGraphicsPipelines(state->device->vk_device,
+             vk_cache, 1, &create_info, NULL, vk_pipeline));
+-    vkd3d_bench_pso_event("graphics link", pso_t0, state, vr);
++    vkd3d_bench_pso_event(lto ? "graphics link" : "graphics fastlink", pso_t0, state, vr);
+ 
+     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
+     {
+@@ -6904,7 +6944,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     if (!library_flags && graphics->library)
+     {
+         if (d3d12_pipeline_state_link_pipeline_variant(state, key, dsv_format,
+-                vk_cache, *dynamic_state_flags, &vk_pipeline) == VK_SUCCESS)
++                vk_cache, *dynamic_state_flags, !key, &vk_pipeline) == VK_SUCCESS)
+             return vk_pipeline;
+     }
+ 
+@@ -7067,7 +7107,12 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+ 
+     pso_t0 = vkd3d_get_current_time_ns();
+     vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+-    vkd3d_bench_pso_event(key ? "graphics variant" : "graphics", pso_t0, state, vr);
++    vkd3d_bench_pso_event(key ? "graphics variant" : library_flags ? "graphics library" : "graphics", pso_t0, state, vr);
++    if (!key && !library_flags)
++    {
++        state->bench_created_ns = vkd3d_get_current_time_ns();
++        state->bench_compile_us = (state->bench_created_ns - pso_t0) / 1000;
++    }
+ 
+     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
+     {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 81be9bc2..59fd4e82 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1077,6 +1077,12 @@ bool vkd3d_index_cache_take_stats(uint64_t *hits, uint64_t *misses, uint64_t *fu
+         uint64_t *scan_steps);
+ void vkd3d_index_cache_invalidate_cpu(const void *address, uint64_t size);
+ void vkd3d_index_cache_disable(const char *why);
++bool vkd3d_index_cache_va_is_source(VkDeviceAddress va);
++void vkd3d_index_cache_exclude(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const char *what);
++struct d3d12_command_allocator;
++size_t vkd3d_index_cache_gpu_write(struct d3d12_command_allocator *allocator, VkDeviceSize src_offset,
++        VkDeviceSize offset, VkDeviceSize size, VkBufferCopy2 **regions, VkBuffer *cache_buffer);
++void vkd3d_index_cache_allocator_reset(struct d3d12_command_allocator *allocator);
+ 
+ struct vkd3d_memory_allocator
+ {
+@@ -2551,6 +2557,12 @@ struct d3d12_pipeline_state
+     bool pso_is_loaded_from_cached_blob;
+     bool pso_is_fully_dynamic;
+ 
++    /* miles-bench: when the main pipeline finished compiling and how long it took, for the
++     * create-to-first-bind gap of slow compiles (frametrace "pso firstbind"). */
++    uint64_t bench_created_ns;
++    uint32_t bench_compile_us;
++    LONG bench_bound;
++
+     struct vkd3d_private_store private_store;
+     struct d3d_destruction_notifier destruction_notifier;
+ 
+@@ -2919,6 +2931,11 @@ struct d3d12_command_allocator
+     VkCommandPool particle_pool;
+     VkCommandBuffer *particle_cbs;
+     size_t particle_cbs_size, particle_cb_count, particle_cb_used;
++    /* miles-bench: index cache runs this allocator's lists mirror GPU writes into (idxcache.c). */
++    uint32_t *idxc_pins;
++    size_t idxc_pins_size, idxc_pin_count;
++    struct { uint32_t epoch, first, last; } *idxc_writes; /* source pages its copies wrote */
++    size_t idxc_writes_size, idxc_write_count;
+     struct d3d12_command_allocator_scratch_pool scratch_pools[VKD3D_SCRATCH_POOL_KIND_COUNT];
+ 
+     VkExtent3D transfer_granularity;

@@ -17,6 +17,9 @@ upstream's history.
 | vkd3d-proton 0005 | | Index cache verify mode: compares the exact bytes each cached draw reads at submission |
 | vkd3d-proton 0006 | S16 | Render-thread CPU cuts |
 | vkd3d-proton 0007 | | Diagnostics: submission and present timing (off unless enabled) |
+| vkd3d-proton 0008 | | Bench input: more keys, autorepeat while held, virtual XInput pad |
+| vkd3d-proton 0009 | | Index cache mirrors GPU copies into the geometry heap instead of turning itself off; PSO and allocation diagnostics (off unless enabled) |
+| vkd3d-proton 0010-0012 | S17 | Deferred command recording through a replay worker (off unless `VKD3D_BENCH_CMD_REPLAY=1`; measured no gain), review fixes |
 | dxil-spirv 0001 | S12 | Per-resource access counting for the descriptor-QA build |
 
 `fork.env` pins the bases, the commit each series ends on and the checkpoint tags.

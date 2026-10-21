@@ -15,6 +15,10 @@
 # world they had run out of VRAM, and missing light grid pages left an area dark). The game
 # lives on the SSD since 2026-10-14: its NVIDIA shader cache (the game folder, as Lutris sets it)
 # was unusable on the HDD, so the same shaders were compiled, and froze the game, every launch.
+# S17 (2026-10-21): the index cache mirrors the game's GPU copies into its geometry heap instead of
+# turning itself off for the session (open world +4.5%, 4.3M cached draws byte-identical), and
+# scx_bpfland schedules the CPU while the game runs (tools/miles-session; open-world frames over 40 ms
+# 12.6 -> 5.2 per minute against S16, fights unchanged at 56-58 fps uncapped).
 set -euo pipefail
 bench=$(cd "$(dirname "$0")/.." && pwd)
 name=${1:-play-$(date +%m%d-%H%M)}
@@ -40,11 +44,21 @@ export VKD3D_BENCH_SKIN_SPARSE=1
 export VKD3D_BENCH_CLEAR_KEEP=1
 export VKD3D_CONFIG_BASE=
 export MEMTRACE=0
-# The frozen checkpoint build (S16: checkpoint-s15 + patches/vkd3d-proton/0005 and 0006,
-# build/checkpoint-s16/SHA256SUMS), not build/memtrace: experiments rebuild that one, and a play
-# session must never pick them up. S15 / S14 / S13 / S12 stay in build/checkpoint-s1{5,4,3,2}
-# (PLAY_DLLS to go back; with S14 or older, VKD3D_BENCH_CLEAR_KEEP has no effect).
-export BENCH_DLLS=${PLAY_DLLS:-$bench/build/checkpoint-s16/bin}
+# The frozen checkpoint build (S17: fork tag checkpoint-s17, build/checkpoint-s17/SHA256SUMS), not
+# build/memtrace or build/s17: experiments rebuild those, and a play session must never pick them up.
+# S16 / S15 / S14 / S13 / S12 stay in build/checkpoint-s1{6,5,4,3,2} (PLAY_DLLS to go back; with S14 or
+# older, VKD3D_BENCH_CLEAR_KEEP has no effect).
+export BENCH_DLLS=${PLAY_DLLS:-$bench/build/checkpoint-s17/bin}
+# scx_bpfland for the session (PLAY_LEVERS=0 skips it): tools/miles-session, installed by
+# tools/install-miles-session.sh, starts it now and stops it when the game exits, or when this
+# script does (the helper watches this script's pid if it is killed before its trap runs).
+if [[ ${PLAY_LEVERS:-1} != 0 ]]; then
+    if sudo -n /usr/local/bin/miles-session start $$ 2>/dev/null; then
+        trap 'sudo -n /usr/local/bin/miles-session stop 2>/dev/null || true' EXIT
+    else
+        echo "miles-session is not installed (sudo tools/install-miles-session.sh); playing without scx_bpfland." >&2
+    fi
+fi
 "$bench/bench/run.sh" "$name"
 cp "$HOME/.local/share/wine/pfx/drive_c/users/zaid/Documents/Marvel's Spider-Man Miles Morales/Marvel's Spider-Man Miles Morales.log" \
     "$bench/captures/$name/game.log" 2>/dev/null || true

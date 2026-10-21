@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Zaid <nottzaid@tutamail.com>
 Date: Thu, 15 Oct 2026 17:57:35 +0300
-Subject: [PATCH 6/7] miles-bench S16: render-thread CPU cuts
+Subject: [PATCH 06/12] miles-bench S16: render-thread CPU cuts
 
 - Frame trace: count draws per command list and add them to the frame
   in ExecuteCommandLists, not one global atomic per draw.

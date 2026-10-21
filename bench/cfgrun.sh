@@ -87,6 +87,13 @@ grep -q '^F' "$cap/frametrace.tsv" || { log "launcher ignores Play"; exit 1; }
 # screenshot every ~15 s goes to shots/ so a failed run can be read afterwards.
 mkdir -p "$cap/shots"
 shot="$cap/menu.png"
+# Open-world saves do not autosave on arrival: there, once Continue was taken and the menu is gone,
+# gameplay is the last 100 frames averaging over 1900 draws (the title cinematic behind the menu
+# draws ~1650, loading screens far fewer; swinging in the city 2200-3500).
+gameplay_draws() {
+    tail -n 400 "$cap/frametrace.tsv" | awk -F'\t' '$1 == "F" {d[n++ % 100] = $4} END {
+        if (n < 100) exit 1; for (i = 0; i < 100; i++) s += d[i]; exit !(s / 100 > 1900) }'
+}
 pressed=0 seen=0 steady=0 n=0 start=$SECONDS
 while (( SECONDS - start < 420 )); do
     sleep 3
@@ -117,7 +124,7 @@ while (( SECONDS - start < 420 )); do
     # autosaves on arrival; the title screen behind the menu is not the menu either), for checkpoints whose
     # HUD the check misses, such as a chase that keeps restarting.
     if [[ ${CFGRUN_NOHUD:-0} == 1 ]]; then
-        if grep -qa 'Request save type 0' "$docs/Marvel's Spider-Man Miles Morales.log" 2>/dev/null; then
+        if grep -qa 'Request save type 0' "$docs/Marvel's Spider-Man Miles Morales.log" 2>/dev/null || gameplay_draws; then
             steady=$((steady + 3))
         else
             steady=0

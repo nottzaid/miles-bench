@@ -1,0 +1,67 @@
+#!/bin/bash
+# System levers for one play session (bench/play.sh), run as root through sudo. Installed as
+# /usr/local/bin/miles-session (root-owned, with /usr/local/lib/miles-session/gpuclk.py) by
+# tools/install-miles-session.sh; the sudo rule allows only that copy, so nothing a user can edit
+# runs as root.
+#
+#   sudo miles-session start <pid>   scx_bpfland and the GPU clock offsets below, until <pid> exits
+#                                    or `stop`, whichever comes first
+#   sudo miles-session stop          back to the kernel scheduler and 0 / 0 offsets
+#
+# Both run in the transient unit miles-session.service (journalctl -u miles-session).
+# scx_bpfland (defaults): traversal frames over 40 ms 10.4 -> 3.7 and 16.2 -> 6.2 per minute (NOTES.md,
+# 2026-10-21). It is left alone when another sched_ext scheduler is already running.
+# GPU offsets (NVML; core MHz, memory MHz on nvidia-smi's scale): see NOTES.md for the fight gain and
+# the stability soak. 0 0 turns them off.
+GPU_CORE=0
+GPU_MEM=0
+set -u
+unit=miles-session
+gpuclk() { /usr/bin/python3 -I /usr/local/lib/miles-session/gpuclk.py "$@" >/dev/null; }
+
+case ${1:-} in
+start)
+    [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "usage: miles-session start <pid>" >&2; exit 2; }
+    systemctl stop $unit 2>/dev/null
+    systemctl reset-failed $unit 2>/dev/null
+    exec systemd-run --quiet --unit=$unit --collect -p KillMode=mixed /usr/local/bin/miles-session run "$2"
+    ;;
+run)
+    pid=$2 sched=
+    finish() {
+        [[ -n $sched ]] && { kill -INT "$sched" 2>/dev/null; wait "$sched"; }
+        gpuclk reset || true
+        echo "session levers off"
+    }
+    trap finish EXIT
+    trap 'exit 0' TERM INT
+    # A scheduler that was just stopped takes a moment to unregister; scx_bpfland started before
+    # then fails with "another sched_ext scheduler is already running".
+    for i in $(seq 20); do
+        [[ $(cat /sys/kernel/sched_ext/state 2>/dev/null) == disabled ]] && break
+        sleep 0.5
+    done
+    if [[ $(cat /sys/kernel/sched_ext/state 2>/dev/null) == disabled ]]; then
+        /usr/bin/scx_bpfland &
+        sched=$!
+    else
+        echo "a sched_ext scheduler is already running; leaving it"
+    fi
+    if (( GPU_CORE || GPU_MEM )); then
+        gpuclk set "$GPU_CORE" "$GPU_MEM" && echo "GPU offsets +$GPU_CORE / +$GPU_MEM" || echo "GPU offsets not set"
+    fi
+    echo "session levers on for pid $pid"
+    while kill -0 "$pid" 2>/dev/null; do
+        [[ -z $sched ]] || kill -0 "$sched" 2>/dev/null || { echo "scx_bpfland exited"; sched=; }
+        sleep 5 & wait $!
+    done
+    ;;
+stop)
+    systemctl stop $unit 2>/dev/null
+    gpuclk reset || true
+    ;;
+*)
+    echo "usage: miles-session start <pid> | stop" >&2
+    exit 2
+    ;;
+esac

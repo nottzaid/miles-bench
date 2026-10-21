@@ -1,7 +1,7 @@
 # Checkpoints
 
 Each step adds to the one before. Switches are environment variables read by the fork
-(`bench/configs/s16-frozen.env` has the full set of the current build; `bench/play.sh` sets the
+(`bench/configs/s17-frozen.env` has the full set of the current build; `bench/play.sh` sets the
 same). What each step gained is in [README.md](../README.md#results)'s step table; the full record of each is in NOTES.md.
 
 | Step | Name | Switch | Code in the fork | Patch |
@@ -17,9 +17,12 @@ same). What each step gained is in [README.md](../README.md#results)'s step tabl
 | S14 | Index cache eviction fix | on with the index cache | `idxcache.c` | 0003 |
 | S15 | Clear keep | `VKD3D_BENCH_CLEAR_KEEP=1` | `command.c`, `enginepatch.c` | 0004, 0005 |
 | S16 | Render-thread CPU cuts | always on | `command.c`, `idxcache.c`, `enginepatch.c` | 0006 |
+| S17 | Open-world index cache | on with the index cache | `idxcache.c`, `command.c` | 0009 (0008, 0010-0012 off unless enabled) |
 
 Patch numbers refer to `patches/vkd3d-proton/`. S5 to S12 were developed before the fork had
-commits, so they arrive together in 0001. 0007 adds diagnostics that are off unless enabled.
+commits, so they arrive together in 0001. 0007 adds diagnostics that are off unless enabled; 0008 the
+bench's key input; 0010-0012 deferred command recording, measured no gain and off unless
+`VKD3D_BENCH_CMD_REPLAY=1`.
 
 ## S5: steps 1-5
 
@@ -96,6 +99,22 @@ Less locking and fewer driver calls on the game's render thread, with nothing th
 changed: draw counts kept per command list, the index cache bound once per command buffer,
 lock-free fence polling, index cache hits under a shared lock, and a lock-free repeat check in
 clear keep.
+
+## S17: open-world index cache
+
+In the open world the game copies new geometry into its 800 MiB geometry heap on the GPU
+(CopyBufferRegion). S16's index cache then turned itself off for the rest of the session, since its
+cached copies could go stale. S17 records the same copy into every cached run that covers the
+written bytes, in the same command buffer, and keeps the written pages out of new runs until the
+command allocator holding the copy is reset. Writers it cannot mirror (UAVs, clears, query
+resolves and the like) take their range out of the cache for good; this game uses none of them on
+the heap. The byte-for-byte verify mode found 0 differing draws in 4.3 million. Same-session A/B
+with the cache switched live: +4.6% and +4.5% fps in the open world. The fight never copies into
+the heap, so it is unchanged there.
+
+Play sessions also run the `scx_bpfland` CPU scheduler while the game is up (`tools/miles-session`,
+a system lever, not part of the fork): frames over 40 ms while swinging fell by more than half in
+same-session A/B. The dashboard's open-world section has every launch and switch.
 
 ## After S16
 
