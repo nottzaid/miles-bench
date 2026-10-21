@@ -123,8 +123,8 @@
     <div class="mm-grid">
       <div class="mm-card mm-wide">
         <h3 id="chart-fps">Frames per second</h3>
-        <div class="mm-chart dash-skeleton" id="fps-chart" data-source="by_step launches"></div>
-        <div class="mm-key"><span><i class="mm-swatch" id="key-accent"></i>current build</span></div>
+        <div class="mm-chart dash-skeleton" id="fps-chart" data-source="by_step launches steps"></div>
+        <div class="mm-key"><span><i class="mm-swatch" id="key-accent"></i>current build in the fight (S16)</span><span><i class="mm-swatch" style="border:1.5px dashed var(--color-fg-muted)"></i>S17: changes the open world only, so the fight was not re-measured; see Open world below</span></div>
       </div>
       <div class="mm-card mm-wide">
         <h3 id="table-pairs">Each step against the one before, in the same series</h3>
@@ -138,17 +138,17 @@
       </div>
       <div class="mm-card mm-wide">
         <h3 id="chart-slow">Frames over 40 ms per minute (mean of its launches)</h3>
-        <div class="mm-chart dash-skeleton" id="slow-chart" data-source="by_step launches"></div>
+        <div class="mm-chart dash-skeleton" id="slow-chart" data-source="by_step launches steps"></div>
         <p class="mm-note">The headline's smoothness measure, step by step: frames that took longer than 40 ms, per minute of the fight.</p>
       </div>
       <div class="mm-card mm-wide">
         <h3 id="chart-freezes">Frames over 100 ms per fight (mean of its launches)</h3>
-        <div class="mm-chart dash-skeleton" id="freeze-chart" data-source="by_step launches"></div>
+        <div class="mm-chart dash-skeleton" id="freeze-chart" data-source="by_step launches steps"></div>
         <p class="mm-note">Every launch counted from the fight's start to the game's 3rd autosave request. From S8 on, <span data-source="freeze_split" data-field="near" data-row="0">—</span> of the <span data-source="freeze_split" data-field="all" data-row="0">—</span> per fight come within seconds of the game's first two autosaves: its own save stalls, the same in every build since. S5 to S7's were the index cache rescanning its ring, fixed in S8; they run far off this scale, so their bars are cut, with their values on top.</p>
       </div>
       <div class="mm-card mm-wide">
         <h3 id="chart-pinned">Driver-pinned system RAM (MiB)</h3>
-        <div class="mm-chart dash-skeleton" id="pinned-chart" data-source="by_step launches"></div>
+        <div class="mm-chart dash-skeleton" id="pinned-chart" data-source="by_step launches steps"></div>
         <p class="mm-note">Mean of each step's launches over all its series. The fall after S13 is the desktop, not a step: on the same S13 build the game pinned <span data-source="desktop_effect" data-field="same_build_pinned_drop_mib" data-row="0">—</span> MiB less in series v16 than in v15, when the desktop held <span data-source="desktop_effect" data-field="same_build_desktop_drop_mib" data-row="0">—</span> MiB less video memory. Within a series, the steps since S12 moved it little (Pinned RAM in the table above).</p>
       </div>
       <div class="mm-card mm-wide">
@@ -233,7 +233,7 @@
         <h3 id="table-levers">Switched back and forth in one running game</h3>
         <p class="mm-note">Each row compares the two settings inside the same session (the switch flipped live, or the session split into alternating windows), which removes the launch-to-launch spread. Uncapped means the game's VSync was off for the run.</p>
         <div class="mm-tablewrap">
-          <table id="levers-table" data-source="s17_levers" data-row-key="run">
+          <table id="levers-table" data-source="s17_levers" data-row-key="run,metric">
             <thead><tr><th data-field="lever">Lever</th><th data-field="scene">Scene</th><th data-field="metric">Measure</th><th class="num" data-field="without">Without</th><th class="num" data-field="with">With</th><th class="num" data-field="change">Change</th><th data-field="outcome">Outcome</th><th data-field="run">Run</th></tr></thead>
             <tbody></tbody>
           </table>
@@ -658,13 +658,15 @@ dash.calc('wh_arms', {
   // Vertical bars per step in step order, the mean of its launches; under the step names, the disk the game ran from.
   // cutOutliers: bars over 5x the median are cut at the top of the axis with a break mark and keep their value, so the
   // other steps stay readable. Value labels that would overlap the one before are left out (the current build's is kept).
+  // ghosts: later steps with no fight launches (S17): an empty dashed slot each, labelled, with no value.
   function drawBars(box, rows, field, valFmt, unit, launches, launchField, opts = {}) {
+    const ghosts = opts.ghosts || [];
     box.querySelectorAll('svg, .mm-tip').forEach((n) => n.remove());
     const W = Math.max(240, box.clientWidth), H = 248;
     const m = { t: 22, r: 6, b: 50, l: 6 };
     const svg = d3.select(box).append('svg').attr('width', '100%').attr('viewBox', `0 0 ${W} ${H}`)
       .attr('role', 'img').attr('aria-label', box.previousElementSibling ? box.previousElementSibling.textContent : '');
-    const x = d3.scaleBand(rows.map((r) => r.step), [m.l, W - m.r]).padding(0.3);
+    const x = d3.scaleBand(rows.map((r) => r.step).concat(ghosts.map((g) => g.step)), [m.l, W - m.r]).padding(0.3);
     const vals = rows.map((r) => r[field]), med = d3.median(vals);
     const cut = (v) => opts.cutOutliers && v > 5 * med;
     const cap = vals.some(cut) ? d3.max(vals.filter((v) => !cut(v))) * 1.6 : d3.max(vals);
@@ -693,8 +695,15 @@ dash.calc('wh_arms', {
         if (!prev || box.x >= prev.right + 6 || box.y >= prev.bottom + 2 || box.bottom <= prev.y - 2) { kept.push(box); return; }
         if (r.step === ACCENT_STEP) { prev.el.remove(); kept[kept.length - 1] = box; } else this.remove();
       });
-    svg.append('g').selectAll('text').data(rows).join('text')
+    svg.append('g').selectAll('text').data(rows.concat(ghosts)).join('text')
       .attr('x', mid).attr('y', H - m.b + 16).attr('text-anchor', 'middle').text((r) => r.step);
+    ghosts.forEach((g) => {
+      const top = y(0) - (y(0) - m.t) * 0.55;
+      svg.append('rect').attr('x', mid(g) - bw / 2).attr('width', bw).attr('y', top).attr('height', y(0) - top)
+        .attr('rx', 4).attr('fill', 'none').attr('stroke', dash.colors[0]).attr('stroke-width', 1.5).attr('stroke-dasharray', '4 3');
+      ['open', 'world', 'only ↓'].forEach((w, i) => svg.append('text').attr('x', mid(g)).attr('y', top - 34 + i * 14)
+        .attr('text-anchor', 'middle').text(w));
+    });
     // The disk row: one bracket per run of consecutive steps on the same disk.
     const runs = [];
     rows.forEach((r) => { const last = runs[runs.length - 1]; if (last && last.disk === r.disk) last.rows.push(r); else runs.push({ disk: r.disk, rows: [r] }); });
@@ -773,7 +782,7 @@ dash.calc('wh_arms', {
     const key = table.dataset.rowKey;
     rows.forEach((r) => {
       const tr = document.createElement('tr');
-      if (key && !cols.includes(key)) tr.dataset.key = String(r[key]);
+      if (key && !key.split(',').every((k) => cols.includes(k))) tr.dataset.key = key.split(',').map((k) => encodeURIComponent(String(r[k]))).join(',');
       cols.forEach((c) => {
         const td = document.createElement('td');
         const v = r[c];
@@ -796,15 +805,20 @@ dash.calc('wh_arms', {
     // Step charts
     const bs = dash.data('by_step'), la = dash.data('launches');
     if (bs.status === 'ok' && bs.data.length) ACCENT_STEP = bs.data[bs.data.length - 1].step;
+    // Steps after the last one with fight launches (S17 changes only the open world): an empty slot on each fight chart.
+    const stp = dash.data('steps');
+    const lastOrder = bs.status === 'ok' && bs.data.length ? d3.max(bs.data, (r) => r.order) : Infinity;
+    const ghosts = stp.status === 'ok' ? stp.data.filter((s) => Number(s.order) > lastOrder)
+      .sort((a, b) => Number(a.order) - Number(b.order)).map((s) => ({ step: s.step })) : [];
     const fpsBox = document.getElementById('fps-chart');
     const bsState = bs.status === 'ok' && la.status === 'ok' ? 'ok' : (bs.status !== 'ok' ? bs.status : la.status);
-    if (setState(fpsBox, bsState)) drawBars(fpsBox, bs.data, 'fps', fmt.fps, ' fps', la.data, 'fps');
+    if (setState(fpsBox, bsState)) drawBars(fpsBox, bs.data, 'fps', fmt.fps, ' fps', la.data, 'fps', { ghosts });
     const slBox = document.getElementById('slow-chart');
-    if (setState(slBox, bsState)) drawBars(slBox, bs.data, 'slow_per_min', fmt.int, ' a minute', la.data, 'over40_per_min');
+    if (setState(slBox, bsState)) drawBars(slBox, bs.data, 'slow_per_min', fmt.int, ' a minute', la.data, 'over40_per_min', { ghosts });
     const frBox = document.getElementById('freeze-chart');
-    if (setState(frBox, bsState)) drawBars(frBox, bs.data, 'over100', fmt.small, '', la.data, 'frames_over_100ms', { cutOutliers: true });
+    if (setState(frBox, bsState)) drawBars(frBox, bs.data, 'over100', fmt.small, '', la.data, 'frames_over_100ms', { cutOutliers: true, ghosts });
     const pnBox = document.getElementById('pinned-chart');
-    if (setState(pnBox, bsState)) drawBars(pnBox, bs.data, 'pinned_mib', fmt.int, ' MiB', la.data, 'pinned_ram_mib');
+    if (setState(pnBox, bsState)) drawBars(pnBox, bs.data, 'pinned_mib', fmt.int, ' MiB', la.data, 'pinned_ram_mib', { ghosts });
 
     const sp = dash.data('step_pairs');
     if (sp.status === 'ok') drawTable(document.getElementById('pairs-table'), sp.data, ['launches', 'before_fps', 'after_fps', 'change_pct', 'pinned_change_mib'],
