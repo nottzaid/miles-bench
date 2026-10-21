@@ -19,7 +19,7 @@ Every script says how to call it in its header. By purpose:
 | `hyprbench.py` | Keep the game on its workspace without moving the user's view or focus; key input and screenshots |
 | `ui.sh` | Keyboard and screenshots through ydotool and grim (older runs) |
 | `sample.sh` | Every 2 s: the game's memory, swap, pinned RAM, VRAM, reads and faults, and GPU use |
-| `configs/` | One `.env` per build and feature set measured; `s16-frozen.env` is the current build |
+| `configs/` | One `.env` per build and feature set measured; `s17-frozen.env` is the current build |
 
 ## Scoring launches
 
@@ -30,6 +30,18 @@ Every script says how to call it in its header. By purpose:
 | `datasets.py` | Rebuild `data/launches.csv`, `vram.csv` and `gaming_mode.csv` from the captures |
 | `fightcsv.py`, `runsum.py`, `gmsum.py` | One line per launch, or per arm of a gaming-mode series |
 | `window.py`, `timeline.py` | Frame statistics of a live trace; a samples.tsv as a timeline |
+
+## The open world, uncapped (S17)
+
+Re-created after the S17 runs (their scratch copies were cleared); not re-run since. docs/method.md,
+Other benches.
+
+| Script | What |
+|---|---|
+| `owrun.sh` | One whole open-world (`saves/swing-1017`) or warehouse launch with VSync off for the run, optionally with `scx_bpfland` from launch to exit |
+| `circledrive.sh` | The circle route by injected keys, with a stuck check that turns Miles back when fps say he is against a wall |
+| `winscore.py` | fps and tails between two frame-trace times |
+| `livetoggle.sh`, `segscore.py` | Alternate a system setting (scheduler, governor, C-states, GPU offsets) in one running game; pool the segments per setting |
 
 ## Live A/B in a running game
 

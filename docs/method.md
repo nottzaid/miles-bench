@@ -87,3 +87,13 @@ way (NOTES.md, Dashboard audit).
   compile stalls and the light grid and skinning losses that left an area dark before S12.
 - **Live A/B** (`bench/abf.py`, `bench/memab.py`): switching a feature on and off in one running game,
   for features that can toggle live.
+- **The open world, uncapped** (S17; `bench/owrun.sh`, `bench/circledrive.sh`, `bench/winscore.py`):
+  whole launches from `saves/swing-1017`, with the bench prefix's VSync off for the run, swinging
+  in circles around the same blocks by injected keys and scored over about 130 s. Launches of the
+  same build spread by several fps, because the city around the route is not the same each time.
+  The precise measurements are switches flipped inside one running game: feature bits through the
+  live A/B, and system settings (CPU scheduler, governor, C-states, GPU offsets) alternated every
+  15 s by `bench/livetoggle.sh` and pooled per setting by `bench/segscore.py`; standing still,
+  uncapped, repeats within 0.3 to 0.6 fps. The scripts that drove the S17 runs lived in a scratch
+  folder that was cleared; these are re-creations of them (same steps, waits and scoring), checked
+  against the bench's interfaces but not re-run. NOTES.md, S17, has the runs.

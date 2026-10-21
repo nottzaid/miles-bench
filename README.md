@@ -2,18 +2,20 @@
 
 *Marvel's Spider-Man: Miles Morales* on half its recommended PC, with nothing taken away from what
 it draws. The machine is a GTX 1060 3 GB, an i5-4670 and 7.7 GiB of RAM; the game asks for a
-GTX 1060 6 GB and 16 GB. The game runs through Proton, and every change here lives in
-vkd3d-proton, the layer that translates its Direct3D 12 calls to Vulkan. No setting is lowered and
-no frame is drawn differently: each change is checked against the unpatched build. It is built
-for the game's launch build, `MilesMorales.exe` 1.1116.0.0 ([Using S17](#using-s17)).
+GTX 1060 6 GB and 16 GB. The game runs through Proton, and every change here lives in vkd3d-proton,
+the layer that translates its Direct3D 12 calls to Vulkan (the fork: `patches/`). No setting is
+lowered and no frame is drawn differently: each change is checked against the unpatched build. It is
+built for the game's launch build, `MilesMorales.exe` 1.1116.0.0 ([Using S17](#using-s17)).
 
 ## Results
 
 The Rhino fight, played by injected keys from its start to the game's 3rd autosave request, at the
-same graphics settings, unpatched against S16, the last step measured in the fight (S17 changes
-only the open world and leaves the fight as it was):
+same graphics settings, unpatched against the current build, S17. Its fight figures are S16's
+launches: S17's change (mirroring GPU copies into the index cache) never runs in the fight, and a
+warehouse-fight check measured S17 at 56.2 fps against S16's 56.4, inside the launch spread
+(NOTES.md, S17):
 
-| | Unpatched (S0) | S16 | |
+| | Unpatched (S0) | S17 (fight launches at S16) | |
 |---|---:|---:|---|
 | Frames per second | 25.2 | 44.1 | +75% |
 | 95th-percentile frame time | 58.9 ms | 30.1 ms | −28.8 ms |
@@ -37,7 +39,7 @@ with launches of the step before in the same series, which is the fair compariso
 | S14 | Index cache eviction fix | SSD | 12 | 43.3 | 15 | 5.3 | 1,963 | +0.48% (v16, 4 + 4) |
 | S15 | Clear keep | SSD | 16 | 44.0 | 14 | 5.3 | 1,955 | +3.12% (v18, v19, 8 + 8) |
 | S16 | Render-thread CPU cuts | SSD | 8 | 44.1 | 14 | 5.5 | 1,941 | +1.22% (v21, v22, 8 + 8) |
-| S17 | Open-world index cache | SSD | — | — | — | — | — | not in the fight bench: changes the open world only |
+| S17 | Open-world index cache | SSD | — | — | — | — | — | not re-run in the fight bench: its change never runs in the fight (warehouse check −0.3%, inside spread) |
 
 S17 changes only the open world. Swinging there with the game uncapped, whole launches of S17
 with the `scx_bpfland` scheduler (how `bench/play.sh` plays it) against S16: 48.0 against 46.6 fps
@@ -55,25 +57,25 @@ step changes and where. The dashboard charts every launch behind these tables:
 
 | Path | What |
 |---|---|
-| `patches/` | The vkd3d-proton fork as a patch series on upstream, plus one dxil-spirv patch. `tools/fork.sh` rebuilds the fork from them with the original commit hashes. |
+| `patches/` | The vkd3d-proton fork as a patch series on upstream, plus one dxil-spirv patch; each series' `fork` links to its fork on GitHub at the commit the series ends on. `tools/fork.sh` rebuilds the fork from the patches with the original commit hashes. Described in [patches/README.md](patches/README.md). |
 | `bench/` | Launching, driving and measuring the game, the analysis scripts, and one `.env` per build measured. Index in [bench/README.md](bench/README.md). |
 | `data/` | The tables behind the results and the dashboard. Described in [data/README.md](data/README.md). |
-| `dashboard/` | The dashboard page (`index.html`, drawn from the tables in `data/`) and `preview.py`, which renders it locally. |
-| `docs/` | How the bench measures, and what each checkpoint changes. |
+| `dashboard/` | The dashboard page (`index.html`, drawn from the tables in `data/`) and `preview.py`, which renders it locally. `index.html` is the published dashboard's page and needs that runtime: opened directly it shows "—" for every figure. |
+| `docs/` | How the bench measures ([docs/method.md](docs/method.md)), and what each checkpoint changes ([docs/checkpoints.md](docs/checkpoints.md)). |
 | `NOTES.md` | The lab notebook: every finding, measurement and dead end, in the order they happened. |
 | `saves/` | Save snapshots the bench loads: `warehouse` (the Rhino fight), `user-1013` (the Rhino chase), `swing-1017` and `user-1017` (the open world). |
 | `tools/` | `fork.sh`; `miles-session` (runs `scx_bpfland` for the length of a play session) and its installer; `gpuclk.py` (NVML clock offsets, measured and not used); the Ghidra client and analysis options used for the reverse engineering. |
 | `tests/` | A smoke test of the allocation tracer. |
 | `flake.nix` | The Nix dev shell: mingw-w64 cross compiler, meson, ninja, glslang, Wine (for widl), Ghidra, Python. |
 
-Not in the repository: `captures/` (11 GB of raw recordings: frame traces, samples, the game's
-logs), `analysis/` (decompilations of the game's code and dumps of its shaders, which belong to
-its publisher; `tools/ghidra-client/dc.sh` writes the decompilations), `build/`, `prefix/` and the Ghidra
-install under `tools/`, and `learned/`, the sizes this machine's sessions learned (every machine
-learns its own). The tables in `data/` are rebuilt from the captures by
-`bench/datasets.py`. The built DLLs of the current checkpoint are attached to the
-`checkpoint-s17` release, with their SHA-256 sums; `tools/fork.sh` tags every checkpoint in the
-fork it rebuilds.
+Not in the repository: `src/` (the fork's working copy, see Building), `captures/` (11 GB of raw
+recordings: frame traces, samples, the game's logs), `analysis/` (decompilations of the game's code
+and dumps of its shaders, which belong to its publisher; `tools/ghidra-client/dc.sh` writes the
+decompilations), `build/`, `prefix/` and the Ghidra install under `tools/`, and `learned/`, the
+sizes this machine's sessions learned (every machine learns its own). The tables in `data/` are
+rebuilt from the captures by `bench/datasets.py`. The built DLLs of the current checkpoint are
+attached to the `checkpoint-s17` release, with their SHA-256 sums; `tools/fork.sh` tags every
+checkpoint in the fork it rebuilds.
 
 ## Using S17
 
@@ -115,13 +117,27 @@ game is not 1.1116.0.0.
 
 ## Building
 
-`tools/fork.sh` needs git and network access (it clones upstream); the build needs Nix, whose
-flake pins the cross compiler and tools. Without Nix, vkd3d-proton's own build instructions should
-apply (mingw-w64, meson, ninja, glslang, widl); that route is untested here.
+The build needs Nix, whose flake pins the cross compiler and tools. Without Nix, vkd3d-proton's own
+build instructions should apply (mingw-w64, meson, ninja, glslang, widl); that route is untested
+here.
+
+The source goes in `src/vkd3d-proton` (the release builds embed that path): the fork from GitHub,
 
 ```sh
-tools/fork.sh                                    # src/vkd3d-proton: upstream 731c4aae + patches/, checked by hash
-git -C src/vkd3d-proton checkout checkpoint-s17  # S17 itself (the tip of the series today)
+git clone --recurse-submodules --branch checkpoint-s17 https://github.com/nottzaid/vkd3d-proton src/vkd3d-proton
+```
+
+or, without the forks on GitHub, the same commits rebuilt from `patches/` (git and network access;
+it clones upstream and checks every hash against `patches/fork.env`):
+
+```sh
+tools/fork.sh                                    # src/vkd3d-proton: upstream 731c4aae + patches/
+git -C src/vkd3d-proton checkout checkpoint-s17  # S17 itself (0013 after it only changes a submodule URL)
+```
+
+then
+
+```sh
 nix develop --command bash -c '
   meson setup --cross-file "$MILES_CROSS_FILE" -Dbuildtype=release -Denable_trace=false \
     -Dc_args=-Wno-error=incompatible-pointer-types \

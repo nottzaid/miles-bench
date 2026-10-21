@@ -1,4 +1,4 @@
-# The fork: tools/fork.sh rebuilds it from upstream and patches/
+# The fork's working copy (cloned from GitHub, or rebuilt by tools/fork.sh from patches/)
 src/
 # Build output: DLLs, the checkpoint binaries, backups, run logs
 build/

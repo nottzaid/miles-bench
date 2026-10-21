@@ -2,7 +2,8 @@
 
 Each step adds to the one before. Switches are environment variables read by the fork
 (`bench/configs/s17-frozen.env` has the full set of the current build; `bench/play.sh` sets the
-same). What each step gained is in [README.md](../README.md#results)'s step table; the full record of each is in NOTES.md.
+same). What each step gained is in [README.md](../README.md#results)'s step table; the full record
+of each is in NOTES.md.
 
 | Step | Name | Switch | Code in the fork | Patch |
 |---|---|---|---|---|
@@ -15,14 +16,15 @@ same). What each step gained is in [README.md](../README.md#results)'s step tabl
 | S12 | Lighting fix + SSD | (larger initial backing; game moved to the SSD) | `lightgrid.c`, `skinbuf.c` | 0001 |
 | S13 | Learned sizes + gates | `VKD3D_BENCH_VRAM_RESERVE=1` (sizes learned per machine) | `learned.c` | 0002 |
 | S14 | Index cache eviction fix | on with the index cache | `idxcache.c` | 0003 |
-| S15 | Clear keep | `VKD3D_BENCH_CLEAR_KEEP=1` | `command.c`, `enginepatch.c` | 0004, 0005 |
+| S15 | Clear keep | `VKD3D_BENCH_CLEAR_KEEP=1` | `command.c`, `enginepatch.c` | 0004 |
 | S16 | Render-thread CPU cuts | always on | `command.c`, `idxcache.c`, `enginepatch.c` | 0006 |
 | S17 | Open-world index cache | on with the index cache | `idxcache.c`, `command.c` | 0009 (0008, 0010-0012 off unless enabled) |
 
 Patch numbers refer to `patches/vkd3d-proton/`. S5 to S12 were developed before the fork had
-commits, so they arrive together in 0001. 0007 adds diagnostics that are off unless enabled; 0008 the
-bench's key input; 0010-0012 deferred command recording, measured no gain and off unless
-`VKD3D_BENCH_CMD_REPLAY=1`.
+commits, so they arrive together in 0001. 0005 adds the index cache's verify mode; 0007 diagnostics
+that are off unless enabled; 0008 the bench's key input; 0010-0012 deferred command recording,
+measured no gain and off unless `VKD3D_BENCH_CMD_REPLAY=1`; 0013, after `checkpoint-s17`, points
+the fork's dxil-spirv submodule at the dxil-spirv fork (no code change).
 
 ## S5: steps 1-5
 
@@ -76,9 +78,9 @@ shaders compiled again, and froze the game, every launch.
 
 The light grid and skinning backing, the VRAM reserve and the budget held back from the game are
 sized from what earlier sessions of this game build on the same GPU actually used (a file each
-machine writes for itself; README, Using S16), instead of constants tuned on this PC. Each feature also checks that it can help before changing anything: a known game
-build, a separate GPU, sparse memory support. On another machine the build falls back to stock
-behaviour wherever a check fails.
+machine writes for itself; README, Using S17), instead of constants tuned on this PC. Each feature
+also checks that it can help before changing anything: a known game build, a separate GPU, sparse
+memory support. On another machine the build falls back to stock behaviour wherever a check fails.
 
 ## S14: index cache eviction fix
 
@@ -116,7 +118,7 @@ Play sessions also run the `scx_bpfland` CPU scheduler while the game is up (`to
 a system lever, not part of the fork): frames over 40 ms while swinging fell by more than half in
 same-session A/B. The dashboard's open-world section has every launch and switch.
 
-## After S16
+## What is left in the fight
 
 The fight is now limited by the GPU: about 21 ms of GPU work per 22.7 ms frame, in render and compute
 passes whose shaders translate cleanly. NOTES.md (S16 follow-up) splits the remaining GPU idle time;

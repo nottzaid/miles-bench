@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zaid <nottzaid@tutamail.com>
+Date: Wed, 21 Oct 2026 19:48:02 +0300
+Subject: [PATCH 13/13] miles-bench: dxil-spirv submodule from the dxil-spirv
+ fork
+
+subprojects/dxil-spirv pins the fork's descriptor_qa commit (6d25da1b), which upstream does not
+carry; the URL now names nottzaid/dxil-spirv. No source change.
+---
+ .gitmodules | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/.gitmodules b/.gitmodules
+index 6e86ca5b..61f83ef1 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -1,6 +1,6 @@
+ [submodule "subprojects/dxil-spirv"]
+ 	path = subprojects/dxil-spirv
+-	url = https://github.com/HansKristian-Work/dxil-spirv
++	url = https://github.com/nottzaid/dxil-spirv
+ [submodule "khronos/Vulkan-Headers"]
+ 	path = khronos/Vulkan-Headers
+ 	url = https://github.com/KhronosGroup/Vulkan-Headers

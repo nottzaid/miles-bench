@@ -1,0 +1,8 @@
+[submodule "patches/vkd3d-proton/fork"]
+	path = patches/vkd3d-proton/fork
+	url = https://github.com/nottzaid/vkd3d-proton
+	update = none
+[submodule "patches/dxil-spirv/fork"]
+	path = patches/dxil-spirv/fork
+	url = https://github.com/nottzaid/dxil-spirv
+	update = none
